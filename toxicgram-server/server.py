@@ -318,6 +318,7 @@ class ProfilePatch(BaseModel):
     username:str|None=Field(default=None,max_length=32)
     bio:str|None=Field(default=None,max_length=160)
 
+@app.put("/v1/profile/partial")
 @app.patch("/v1/profile")
 def patch_profile(body:ProfilePatch,request:Request):
     _,n=session(request)
