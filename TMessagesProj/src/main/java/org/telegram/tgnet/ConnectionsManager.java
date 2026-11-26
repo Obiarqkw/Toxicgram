@@ -808,6 +808,7 @@ public class ConnectionsManager extends BaseController {
     public void setAppPaused(final boolean value, final boolean byScreenState) {
         if (ToxicgramRpc.ENABLED) {
             appPaused = value;
+            ToxicgramRpc.setForeground(currentAccount, !value);
             if (!value) ToxicgramRpc.probe(currentAccount);
             return;
         }
