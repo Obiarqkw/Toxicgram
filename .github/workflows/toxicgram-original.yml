@@ -37,6 +37,32 @@ jobs:
           python3 scripts/toxicgram-original-build.py
           rm -f TMessagesProj/config/release.keystore
           keytool -genkeypair -keystore TMessagesProj/config/release.keystore -storepass android -keypass android -alias androidkey -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=Toxicgram Development"
+      - name: Configure Maven Central mirror for Gradle
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/toxicgram-central.gradle" <<'EOF'
+          import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+          def centralMirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+          def redirectCentral = { repositories ->
+              repositories.withType(MavenArtifactRepository).configureEach { repo ->
+                  if (repo.url?.host in ['repo.maven.apache.org', 'repo1.maven.org']) {
+                      repo.url = URI.create(centralMirror)
+                  }
+              }
+          }
+          gradle.beforeSettings { settings ->
+              settings.pluginManagement.repositories {
+                  maven { url = URI.create(centralMirror) }
+                  gradlePluginPortal()
+              }
+              redirectCentral(settings.pluginManagement.repositories)
+              redirectCentral(settings.dependencyResolutionManagement.repositories)
+          }
+          gradle.beforeProject { project ->
+              redirectCentral(project.buildscript.repositories)
+              redirectCentral(project.repositories)
+          }
+          EOF
       - name: Compile original Telegram Android sources
         run: bash gradlew :TMessagesProj_AppStandalone:assembleAfatDebug --no-daemon --stacktrace --max-workers=2
       - name: Confirm APK output
