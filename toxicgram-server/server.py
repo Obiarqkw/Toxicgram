@@ -51,6 +51,8 @@ def init():
         CREATE TABLE IF NOT EXISTS avatars (number TEXT PRIMARY KEY, media_id TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS wallets (number TEXT PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 1000);
         CREATE TABLE IF NOT EXISTS gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, created INTEGER NOT NULL, serial TEXT UNIQUE NOT NULL);
+        CREATE TABLE IF NOT EXISTS gift_details (gift_id INTEGER PRIMARY KEY, visible INTEGER NOT NULL DEFAULT 0, anonymous INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS gift_orders (sender TEXT NOT NULL, request_id TEXT NOT NULL, gift_id INTEGER NOT NULL, PRIMARY KEY(sender,request_id));
         CREATE TABLE IF NOT EXISTS stories (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, text TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS story_owner ON stories(owner,created);
         """)
@@ -641,9 +643,44 @@ def get_media(mid:str,request:Request):
         return Response(content=row["content"],media_type=row["mime"],headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff","Content-Disposition":"attachment"})
 
 CATALOG={"heart":{"name":"Сердце","emoji":"💝","price":50},"bear":{"name":"Мишка","emoji":"🧸","price":100},"rose":{"name":"Роза","emoji":"🌹","price":75},"star":{"name":"Звезда","emoji":"🌟","price":150},"crystal":{"name":"Кристалл","emoji":"💎","price":250}}
+CATALOG.update({"present":{"name":"Подарок","emoji":"🎁","price":100},"cake":{"name":"Торт","emoji":"🎂","price":120}})
+GIFT_ART={"heart":"email_setup_heart","star":"star_reaction","crystal":"wallet_diamond_blue","present":"gift","cake":"cake"}
 class GiftSend(BaseModel):
     recipient:str=Field(max_length=40)
     kind:str=Field(max_length=24)
+    request_id:str=Field(default="",max_length=80)
+    anonymous:bool=False
+    message:str=Field(default="",max_length=250)
+
+def gift_row(row,own):
+    item=dict(row)
+    if item.get("anonymous") or not own: item.pop("sender",None)
+    return item
+
+@app.get("/v1/users/{number}/gifts")
+def profile_gifts(number:str,request:Request):
+    _,n=session(request);peer=normalize_number(number)
+    with db() as c:
+        require_peer(c,peer)
+        if peer!=n and c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone(): raise HTTPException(403,"Gift collection unavailable")
+        rows=c.execute("""SELECT g.id,g.kind,g.serial,g.created,g.sender,COALESCE(d.visible,0) AS visible,
+        COALESCE(d.anonymous,0) AS anonymous,COALESCE(d.message,'') AS message FROM gifts g
+        LEFT JOIN gift_details d ON d.gift_id=g.id WHERE g.recipient=? AND (?=1 OR d.visible=1)
+        ORDER BY g.id DESC LIMIT 100""",(peer,int(peer==n))).fetchall()
+    return {"received":[gift_row(x,peer==n) for x in rows]}
+
+class GiftVisibility(BaseModel):
+    visible:bool
+
+@app.put("/v1/gifts/{gid}/visibility")
+def gift_visibility(gid:int,body:GiftVisibility,request:Request):
+    _,n=session(request)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if not c.execute("SELECT 1 FROM gifts WHERE id=? AND recipient=?",(gid,n)).fetchone(): raise HTTPException(404,"Gift not found")
+        c.execute("INSERT INTO gift_details(gift_id,visible) VALUES (?,?) ON CONFLICT(gift_id) DO UPDATE SET visible=excluded.visible",(gid,int(body.visible)))
+        c.commit()
+    return {"ok":True}
 
 @app.get("/v1/gifts")
 def gift_catalog(request:Request):
@@ -652,7 +689,7 @@ def gift_catalog(request:Request):
         c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(n,))
         balance=c.execute("SELECT balance FROM wallets WHERE number=?",(n,)).fetchone()[0]
         rows=c.execute("SELECT id,kind,serial,created FROM gifts WHERE recipient=? ORDER BY id DESC LIMIT 100",(n,)).fetchall()
-    return {"balance":balance,"catalog":[{"kind":k,**v} for k,v in CATALOG.items()],"received":[dict(x) for x in rows]}
+    return {"balance":balance,"catalog":[{"kind":k,**v,"art":GIFT_ART.get(k,"")} for k,v in CATALOG.items()],"received":[dict(x) for x in rows]}
 
 @app.post("/v1/gifts")
 def send_gift(body:GiftSend,request:Request):
@@ -664,12 +701,20 @@ def send_gift(body:GiftSend,request:Request):
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         require_peer(c,peer)
+        if body.request_id:
+            prior=c.execute("SELECT g.serial,g.kind,g.recipient FROM gift_orders o JOIN gifts g ON g.id=o.gift_id WHERE o.sender=? AND o.request_id=?",(n,body.request_id)).fetchone()
+            if prior:
+                if prior["kind"]!=body.kind or prior["recipient"]!=peer: raise HTTPException(409,"Order mismatch")
+                c.commit()
+                return {"serial":prior["serial"]}
         if c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone(): raise HTTPException(403,"Gift unavailable")
         c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(n,))
         changed=c.execute("UPDATE wallets SET balance=balance-? WHERE number=? AND balance>=?",(item["price"],n,item["price"])).rowcount
         if not changed: raise HTTPException(409,"Not enough demo stars")
         serial=secrets.token_hex(8)
-        c.execute("INSERT INTO gifts(sender,recipient,kind,created,serial) VALUES (?,?,?,?,?)",(n,peer,body.kind,int(time.time()),serial))
+        gid=c.execute("INSERT INTO gifts(sender,recipient,kind,created,serial) VALUES (?,?,?,?,?)",(n,peer,body.kind,int(time.time()),serial)).lastrowid
+        c.execute("INSERT INTO gift_details(gift_id,visible,anonymous,message) VALUES (?,?,?,?)",(gid,0,int(body.anonymous),body.message.strip()))
+        if body.request_id: c.execute("INSERT INTO gift_orders VALUES (?,?,?)",(n,body.request_id,gid))
         c.commit()
     return {"serial":serial}
 
