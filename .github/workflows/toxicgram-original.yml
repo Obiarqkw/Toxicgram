@@ -40,4 +40,13 @@ jobs:
       - name: Compile original Telegram Android sources
         run: bash gradlew :TMessagesProj_AppStandalone:assembleAfatDebug --no-daemon --stacktrace --max-workers=2
       - name: Confirm APK output
-        run: find TMessagesProj_AppStandalone/build/outputs/apk -name '*.apk' -print
+        run: |
+          find TMessagesProj_AppStandalone/build/outputs/apk -type f -name '*.apk' -print
+          test -n "$(find TMessagesProj_AppStandalone/build/outputs/apk -type f -name '*.apk' -print -quit)"
+      - name: Upload experimental Toxicgram APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Toxicgram-original-dev-APK
+          path: TMessagesProj_AppStandalone/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
