@@ -14,6 +14,7 @@ import org.json.JSONObject;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.Utilities;
 import org.telegram.tgnet.tl.TL_stars;
+import org.telegram.tgnet.tl.TL_account;
 import java.io.*;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -104,9 +105,9 @@ public final class ToxicgramRpc {
     }
     private static TLRPC.TL_user user(JSONObject p,boolean self)throws Exception{
         TLRPC.TL_user u=new TLRPC.TL_user();
-        u.id=userId(p.getString("number"));u.first_name=p.optString("name",p.optString("phone","Toxicgram"));
+        u.id=userId(p.getString("number"));u.first_name=p.optString("first_name",p.optString("name",p.optString("phone","Toxicgram")));u.last_name=p.optString("last_name","");
         u.phone=p.optString("phone","").replace("+","");u.username=p.optString("username","");
-        u.self=self;u.flags=2|16|(u.username.isEmpty()?0:8)|(self?1024:0);
+        u.self=self;u.flags=2|4|16|(u.username.isEmpty()?0:8)|(self?1024:0);
         u.access_hash=u.id;u.flags|=1;
         return u;
     }
@@ -301,7 +302,123 @@ public final class ToxicgramRpc {
         }
         return null;
     }
+    private static String inputUser(int a,TLRPC.InputUser input)throws ApiError{
+        if(input instanceof TLRPC.TL_inputUserSelf)return prefs(a).getString("number","");
+        if(input instanceof TLRPC.TL_inputUser)return canonical(input.user_id);
+        throw new ApiError(400,"PEER_ID_INVALID");
+    }
+    private static TLRPC.TL_updates updates(){
+        TLRPC.TL_updates u=new TLRPC.TL_updates();u.date=(int)(System.currentTimeMillis()/1000L);return u;
+    }
+    private static TLObject profileRpc(int a,TLObject req)throws Exception{
+        if(req instanceof TL_account.updateProfile){
+            TL_account.updateProfile q=(TL_account.updateProfile)req;JSONObject body=new JSONObject();
+            if((q.flags&1)!=0)body.put("first_name",q.first_name);
+            if((q.flags&2)!=0)body.put("last_name",q.last_name);
+            if((q.flags&4)!=0)body.put("bio",q.about);
+            return user(http("PUT","/v1/profile/partial",body,token(a)),true);
+        }
+        if(req instanceof TL_account.checkUsername){
+            String username=((TL_account.checkUsername)req).username;
+            try{if(!http("GET","/v1/username/check?username="+android.net.Uri.encode(username),null,token(a)).getBoolean("available"))throw new ApiError(400,"USERNAME_OCCUPIED");}
+            catch(ApiError e){if(e.code==400&&!"USERNAME_OCCUPIED".equals(e.type))throw new ApiError(400,"USERNAME_INVALID");throw e;}
+            return new TLRPC.TL_boolTrue();
+        }
+        if(req instanceof TL_account.updateUsername){
+            try{return user(http("PUT","/v1/profile/partial",new JSONObject().put("username",((TL_account.updateUsername)req).username),token(a)),true);}
+            catch(ApiError e){if(e.code==409)throw new ApiError(400,"USERNAME_OCCUPIED");if(e.code==400)throw new ApiError(400,"USERNAME_INVALID");throw e;}
+        }
+        if(req instanceof TLRPC.TL_users_getFullUser){
+            String number=inputUser(a,((TLRPC.TL_users_getFullUser)req).id);
+            boolean self=number.equals(prefs(a).getString("number",""));
+            JSONObject p=http("GET",self?"/v1/me":"/v1/users/"+number,null,token(a));
+            TLRPC.TL_users_userFull result=new TLRPC.TL_users_userFull();
+            TLRPC.TL_userFull full=new TLRPC.TL_userFull();full.id=userId(number);full.about=p.optString("bio","");full.flags=2;
+            full.settings=new TLRPC.TL_peerSettings();full.notify_settings=new TLRPC.TL_peerNotifySettings();
+            full.stargifts_count=p.optInt("gift_count",0);
+            result.full_user=full;result.users.add(user(p,self));return result;
+        }
+        if(req instanceof TLRPC.TL_contacts_search){
+            String q=((TLRPC.TL_contacts_search)req).q;
+            JSONArray users=http("GET","/v1/users-search?q="+android.net.Uri.encode(q),null,token(a)).getJSONArray("users");
+            TLRPC.TL_contacts_found result=new TLRPC.TL_contacts_found();
+            for(int i=0;i<users.length();i++){JSONObject p=users.getJSONObject(i);result.users.add(user(p,false));result.results.add(peerObject(p.getString("number")));}
+            return result;
+        }
+        return null;
+    }
+    private static final long ROOM_BASE=300000000L;
+    private static final int ROOM_MESSAGE_BASE=1000000000;
+    private static boolean isRoom(TLRPC.InputPeer p){return p instanceof TLRPC.TL_inputPeerChat||p instanceof TLRPC.TL_inputPeerChannel;}
+    private static long roomPeerId(TLRPC.InputPeer p)throws ApiError{
+        if(p instanceof TLRPC.TL_inputPeerChat)return p.chat_id;
+        if(p instanceof TLRPC.TL_inputPeerChannel)return p.channel_id;
+        throw new ApiError(400,"PEER_ID_INVALID");
+    }
+    private static JSONObject roomInfo(int a,long id)throws Exception{
+        if(id<=ROOM_BASE)throw new ApiError(400,"CHAT_ID_INVALID");
+        return http("GET","/v1/rooms/by-id/"+(id-ROOM_BASE),null,token(a));
+    }
+    private static TLRPC.Chat roomChat(JSONObject row,String self)throws Exception{
+        boolean channel="channel".equals(row.optString("mode"));
+        TLRPC.Chat chat=channel?new TLRPC.TL_channel():new TLRPC.TL_chat();
+        chat.id=ROOM_BASE+row.getLong("numeric_id");chat.title=row.getString("title");chat.photo=new TLRPC.TL_chatPhotoEmpty();
+        chat.creator=self.equals(row.optString("owner"));chat.date=row.optInt("created",1);chat.participants_count=row.optInt("members",1);chat.version=1;
+        if(channel){chat.access_hash=chat.id;chat.broadcast="channel".equals(row.optString("kind"));chat.megagroup=!chat.broadcast;chat.flags=8192|131072|(chat.broadcast?32:256)|(chat.creator?1:0);}
+        else chat.flags=chat.creator?1:0;
+        return chat;
+    }
+    private static TLRPC.Peer roomPeer(JSONObject row)throws Exception{
+        long id=ROOM_BASE+row.getLong("numeric_id");
+        if("channel".equals(row.optString("mode"))){TLRPC.TL_peerChannel p=new TLRPC.TL_peerChannel();p.channel_id=id;return p;}
+        TLRPC.TL_peerChat p=new TLRPC.TL_peerChat();p.chat_id=id;return p;
+    }
+    private static TLRPC.TL_message roomMessage(JSONObject row,JSONObject room,String self)throws Exception{
+        TLRPC.TL_message m=new TLRPC.TL_message();m.id=Math.addExact(ROOM_MESSAGE_BASE,row.getInt("id"));m.date=row.getInt("created");m.message=row.optString("text","");
+        m.peer_id=roomPeer(room);m.out=self.equals(row.optString("sender"));m.from_id=peerObject(row.getString("sender"));m.flags=256|(m.out?2:0);m.media=new TLRPC.TL_messageMediaEmpty();return m;
+    }
+    private static TLObject roomsRpc(int a,TLObject req)throws Exception{
+        String self=prefs(a).getString("number","");
+        if(req instanceof TLRPC.TL_messages_createChat){
+            TLRPC.TL_messages_createChat q=(TLRPC.TL_messages_createChat)req;JSONArray members=new JSONArray();
+            for(TLRPC.InputUser u:q.users)members.put(inputUser(a,u));
+            JSONObject room=http("POST","/v1/rooms",new JSONObject().put("kind","group").put("mode","basic").put("title",q.title).put("members",members),token(a));
+            TLRPC.TL_messages_invitedUsers result=new TLRPC.TL_messages_invitedUsers();TLRPC.TL_updates u=updates();u.chats.add(roomChat(room,self));result.updates=u;return result;
+        }
+        if(req instanceof TLRPC.TL_channels_createChannel){
+            TLRPC.TL_channels_createChannel q=(TLRPC.TL_channels_createChannel)req;
+            JSONObject room=http("POST","/v1/rooms",new JSONObject().put("kind",q.megagroup?"group":"channel").put("mode","channel").put("title",q.title).put("about",q.about==null?"":q.about),token(a));
+            TLRPC.TL_updates u=updates();u.chats.add(roomChat(room,self));return u;
+        }
+        if(req instanceof TLRPC.TL_channels_inviteToChannel){
+            TLRPC.TL_channels_inviteToChannel q=(TLRPC.TL_channels_inviteToChannel)req;
+            JSONObject room=roomInfo(a,q.channel.channel_id).getJSONObject("room");
+            for(TLRPC.InputUser u:q.users)http("POST","/v1/rooms/"+room.getString("id")+"/invite",new JSONObject().put("number",inputUser(a,u)),token(a));
+            TLRPC.TL_messages_invitedUsers result=new TLRPC.TL_messages_invitedUsers();TLRPC.TL_updates u=updates();u.chats.add(roomChat(roomInfo(a,q.channel.channel_id).getJSONObject("room"),self));result.updates=u;return result;
+        }
+        if(req instanceof TLRPC.TL_messages_getHistory && isRoom(((TLRPC.TL_messages_getHistory)req).peer)){
+            TLRPC.TL_messages_getHistory q=(TLRPC.TL_messages_getHistory)req;String t=token(a);
+            JSONObject info=roomInfo(a,roomPeerId(q.peer)),room=info.getJSONObject("room");
+            String path="/v1/rooms/"+room.getString("id")+"/messages"+(q.offset_id>ROOM_MESSAGE_BASE?"?before="+(q.offset_id-ROOM_MESSAGE_BASE):"");
+            JSONArray messages=http("GET",path,null,t).getJSONArray("messages"),members=info.getJSONArray("users");
+            TLRPC.TL_messages_messages result=new TLRPC.TL_messages_messages();
+            for(int i=messages.length()-1;i>=0;i--)result.messages.add(roomMessage(messages.getJSONObject(i),room,self));
+            for(int i=0;i<members.length();i++){JSONObject p=members.getJSONObject(i);result.users.add(user(p,self.equals(p.getString("number"))));}
+            result.chats.add(roomChat(room,self));return result;
+        }
+        if(req instanceof TLRPC.TL_messages_sendMessage && isRoom(((TLRPC.TL_messages_sendMessage)req).peer)){
+            TLRPC.TL_messages_sendMessage q=(TLRPC.TL_messages_sendMessage)req;
+            JSONObject room=roomInfo(a,roomPeerId(q.peer)).getJSONObject("room");
+            JSONObject sent=http("POST","/v1/rooms/"+room.getString("id")+"/messages",new JSONObject().put("text",q.message),token(a));
+            TLRPC.TL_updateShortSentMessage result=new TLRPC.TL_updateShortSentMessage();result.id=Math.addExact(ROOM_MESSAGE_BASE,sent.getInt("id"));result.date=sent.getInt("created");result.out=true;result.flags=2;return result;
+        }
+        return null;
+    }
     private static TLObject dispatch(int a,TLObject req)throws Exception{
+        TLObject profileResponse=profileRpc(a,req);
+        if(profileResponse!=null)return profileResponse;
+        TLObject roomResponse=roomsRpc(a,req);
+        if(roomResponse!=null)return roomResponse;
         TLObject giftResponse=gifts(a,req);
         if(giftResponse!=null)return giftResponse;
         if(req instanceof TLRPC.TL_auth_sendCode || req instanceof TLRPC.TL_auth_resendCode){
@@ -347,6 +464,18 @@ public final class ToxicgramRpc {
                 // Fetch actual latest message rather than infer its sender from the dialog.
                 JSONArray history=http("GET","/v1/chats/"+number+"/messages",null,t).getJSONArray("messages");
                 if(history.length()>0)result.messages.add(message(history.getJSONObject(history.length()-1),self));
+            }
+            JSONArray rooms=http("GET","/v1/rooms",null,t).getJSONArray("rooms");
+            for(int i=0;i<rooms.length();i++){
+                JSONObject row=rooms.getJSONObject(i);result.chats.add(roomChat(row,self));
+                TLRPC.TL_dialog dialog=new TLRPC.TL_dialog();dialog.peer=roomPeer(row);dialog.notify_settings=new TLRPC.TL_peerNotifySettings();
+                JSONArray history=http("GET","/v1/rooms/"+row.getString("id")+"/messages",null,t).getJSONArray("messages");
+                if(history.length()>0){
+                    JSONObject latest=history.getJSONObject(history.length()-1);TLRPC.TL_message m=roomMessage(latest,row,self);dialog.top_message=m.id;result.messages.add(m);
+                    String sender=latest.getString("sender");
+                    if(!self.equals(sender))result.users.add(user(http("GET","/v1/users/"+sender,null,t),false));
+                }
+                result.dialogs.add(dialog);
             }
             return result;
         }
