@@ -30,6 +30,10 @@ def init():
         CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS msg_sender_recipient ON messages(sender,recipient,id);
         CREATE INDEX IF NOT EXISTS msg_recipient_sender ON messages(recipient,sender,id);
+        CREATE TABLE IF NOT EXISTS chat_settings (owner TEXT NOT NULL, peer TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner,peer));
+        CREATE TABLE IF NOT EXISTS hidden_messages (owner TEXT NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY(owner,message_id));
+        CREATE TABLE IF NOT EXISTS read_state (owner TEXT NOT NULL, peer TEXT NOT NULL, last_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner,peer));
+        CREATE TABLE IF NOT EXISTS message_edits (message_id INTEGER PRIMARY KEY, edited INTEGER NOT NULL);
         """)
 
 def digest(s):
@@ -224,12 +228,13 @@ def chats(request:Request):
         rows=c.execute("""
         WITH relevant AS (
           SELECT *, CASE WHEN sender=? THEN recipient ELSE sender END AS peer
-          FROM messages WHERE sender=? OR recipient=?
+          FROM messages WHERE (sender=? OR recipient=?) AND NOT EXISTS (SELECT 1 FROM hidden_messages h WHERE h.owner=? AND h.message_id=messages.id)
         ), latest AS (SELECT peer,MAX(id) AS id FROM relevant GROUP BY peer)
-        SELECT r.peer AS number,COALESCE(p.name,r.peer) AS name,r.body AS text,r.created,r.id
+        SELECT r.peer AS number,COALESCE(p.name,r.peer) AS name,r.body AS text,r.created,r.id, COALESCE(s.pinned,0) AS pinned, COALESCE(s.archived,0) AS archived, (SELECT COUNT(*) FROM relevant v WHERE v.peer=r.peer AND v.sender=r.peer AND v.sender<>? AND v.id>COALESCE(rs.last_id,0)) AS unread
         FROM latest l JOIN relevant r ON r.id=l.id LEFT JOIN profiles p ON p.number=r.peer
-        ORDER BY r.id DESC LIMIT 100
-        """,(n,n,n)).fetchall()
+        LEFT JOIN chat_settings s ON s.owner=? AND s.peer=r.peer LEFT JOIN read_state rs ON rs.owner=? AND rs.peer=r.peer
+        ORDER BY pinned DESC,r.id DESC LIMIT 100
+        """,(n,n,n,n,n,n,n)).fetchall()
     return {"chats":[dict(row) for row in rows]}
 
 @app.get("/v1/chats/{number}/messages")
@@ -240,8 +245,8 @@ def history(number:str,request:Request,after:int=0,before:int=0):
         raise HTTPException(400,"Invalid cursor")
     with db() as c:
         require_peer(c,peer)
-        base="SELECT id,sender,recipient,body AS text,created FROM messages WHERE ((sender=? AND recipient=?) OR (sender=? AND recipient=?))"
-        args=(n,peer,peer,n)
+        base="SELECT id,sender,recipient,body AS text,created,COALESCE((SELECT edited FROM message_edits e WHERE e.message_id=messages.id),0) AS edited FROM messages WHERE ((sender=? AND recipient=?) OR (sender=? AND recipient=?)) AND NOT EXISTS (SELECT 1 FROM hidden_messages h WHERE h.owner=? AND h.message_id=messages.id)"
+        args=(n,peer,peer,n,n)
         if after:
             rows=c.execute(base+" AND id>? ORDER BY id ASC LIMIT 100",args+(after,)).fetchall()
         elif before:
@@ -265,3 +270,72 @@ def send(body:MessageCreate,request:Request):
         cur=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,value,now))
         mid=cur.lastrowid
     return {"id":mid,"sender":n,"recipient":peer,"text":value,"created":now}
+
+class EditMessage(BaseModel):
+    text: str = Field(min_length=1,max_length=4000)
+
+class ChatSettings(BaseModel):
+    pinned: bool | None = None
+    archived: bool | None = None
+
+class MarkRead(BaseModel):
+    last_id: int = Field(ge=0)
+
+def own_message(c, n, mid):
+    row=c.execute("SELECT * FROM messages WHERE id=? AND (sender=? OR recipient=?)",(mid,n,n)).fetchone()
+    if not row:
+        raise HTTPException(404,"Message not found")
+    return row
+
+@app.put("/v1/messages/{mid}")
+def edit_message(mid:int, body:EditMessage, request:Request):
+    _,n=session(request)
+    value=body.text.strip()
+    if not value: raise HTTPException(400,"Empty message")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=own_message(c,n,mid)
+        if row["sender"]!=n: raise HTTPException(403,"Only sender can edit")
+        c.execute("UPDATE messages SET body=? WHERE id=?",(value,mid))
+        c.execute("INSERT INTO message_edits VALUES (?,?) ON CONFLICT(message_id) DO UPDATE SET edited=excluded.edited",(mid,int(time.time())))
+        c.commit()
+    return {"ok":True}
+
+@app.delete("/v1/messages/{mid}")
+def delete_message(mid:int,request:Request,everyone:bool=False):
+    _,n=session(request)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=own_message(c,n,mid)
+        if everyone:
+            if row["sender"]!=n: raise HTTPException(403,"Only sender can delete for everyone")
+            c.execute("DELETE FROM messages WHERE id=?",(mid,))
+            c.execute("DELETE FROM hidden_messages WHERE message_id=?",(mid,))
+            c.execute("DELETE FROM message_edits WHERE message_id=?",(mid,))
+        else:
+            c.execute("INSERT OR IGNORE INTO hidden_messages VALUES (?,?)",(n,mid))
+        c.commit()
+    return {"ok":True}
+
+@app.put("/v1/chats/{number}/settings")
+def chat_settings(number:str, body:ChatSettings,request:Request):
+    _,n=session(request)
+    peer=normalize_number(number)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        require_peer(c,peer)
+        c.execute("INSERT OR IGNORE INTO chat_settings(owner,peer) VALUES (?,?)",(n,peer))
+        if body.pinned is not None: c.execute("UPDATE chat_settings SET pinned=? WHERE owner=? AND peer=?",(int(body.pinned),n,peer))
+        if body.archived is not None: c.execute("UPDATE chat_settings SET archived=? WHERE owner=? AND peer=?",(int(body.archived),n,peer))
+        c.commit()
+    return {"ok":True}
+
+@app.put("/v1/chats/{number}/read")
+def mark_read(number:str,body:MarkRead,request:Request):
+    _,n=session(request)
+    peer=normalize_number(number)
+    with db() as c:
+        require_peer(c,peer)
+        last=c.execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE sender=? AND recipient=? AND id<=?",(peer,n,body.last_id)).fetchone()[0]
+        c.execute("INSERT INTO read_state VALUES (?,?,?) ON CONFLICT(owner,peer) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)",(n,peer,last))
+    return {"ok":True}
