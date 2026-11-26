@@ -190,5 +190,69 @@ class MessagingTest(unittest.TestCase):
                 server.ADMIN_KEY=previous
 
 
+    def test_admin_user_management(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server.DB=str(Path(temp)/"test.sqlite3")
+            server.PEPPER="test-only-key-not-for-deployment-0000000"
+            server.TOKEN=""
+            previous=server.ADMIN_KEY
+            server.ADMIN_KEY="test-admin-key-not-for-deployment-000000000"
+            admin={"Authorization":"Bearer "+server.ADMIN_KEY}
+            try:
+                with TestClient(server.app) as client:
+                    n,code=server.issue(121)
+                    login=client.post("/v1/auth/verify",json={"number":n,"code":code})
+                    h={"Authorization":"Bearer "+login.json()["access_token"]}
+                    path="/v1/admin/users/"+n
+                    self.assertEqual(client.get(path,headers=h).status_code,401)
+                    self.assertEqual(client.get("/v1/admin/users",headers=h).status_code,401)
+                    self.assertEqual(client.put("/v1/profile",headers=h,json={"name":"Test User","username":"admin_test_user","bio":"Test bio"}).status_code,200)
+                    listing=client.get("/v1/admin/users?q=admin_test_user",headers=admin).json()["users"]
+                    self.assertEqual(len(listing),1)
+                    self.assertEqual(listing[0]["number"],n)
+                    self.assertNotIn("telegram_id",listing[0])
+                    self.assertNotIn("code_hash",listing[0])
+                    self.assertEqual(client.get(path,headers=admin).json()["user"]["balance"],1000)
+                    body={"request_id":"a"*32,"delta":500,"reason":"test credit"}
+                    self.assertEqual(client.post(path+"/stars",headers=h,json=body).status_code,401)
+                    self.assertEqual(client.post(path+"/stars",headers=admin,json=body).json()["balance"],1500)
+                    self.assertEqual(client.post(path+"/stars",headers=admin,json=body).json()["balance"],1500)
+                    self.assertEqual(client.post(path+"/stars",headers=admin,json={**body,"delta":1}).status_code,409)
+                    self.assertEqual(client.post(path+"/stars",headers=admin,json={**body,"request_id":"b"*32,"delta":-2000}).status_code,409)
+                    self.assertEqual(client.post(path+"/stars",headers=admin,json={**body,"request_id":"c"*32,"delta":-200}).json()["balance"],1300)
+                    grant={"request_id":"d"*32,"kind":"plush-pepe","reason":"test grant"}
+                    self.assertEqual(client.post(path+"/gift",headers=h,json=grant).status_code,401)
+                    first=client.post(path+"/gift",headers=admin,json=grant)
+                    self.assertEqual(first.status_code,200)
+                    self.assertEqual(client.post(path+"/gift",headers=admin,json=grant).json(),first.json())
+                    self.assertEqual(client.get("/v1/gifts",headers=h).json()["balance"],1300)
+                    received=client.get("/v1/users/"+n+"/gifts",headers=h).json()["received"]
+                    self.assertEqual(len(received),1);self.assertNotIn("sender",received[0])
+                    self.assertEqual(received[0]["num"],1)
+                    with server.db() as db:
+                        db.execute("UPDATE catalog_gifts SET supply=1 WHERE kind='plush-pepe'")
+                        db.execute("UPDATE accounts SET issued=0 WHERE number=?",(n,))
+                    self.assertEqual(client.post(path+"/gift",headers=admin,json={**grant,"request_id":"e"*32}).status_code,410)
+                    _,fresh=server.issue(121)
+                    freeze={"request_id":"f"*32,"reason":"test freeze","frozen":True}
+                    self.assertEqual(client.post(path+"/freeze",headers=h,json=freeze).status_code,401)
+                    self.assertEqual(client.post(path+"/freeze",headers=admin,json=freeze).status_code,200)
+                    self.assertEqual(client.get("/v1/me",headers=h).status_code,401)
+                    self.assertEqual(client.post("/v1/auth/verify",json={"number":n,"code":fresh}).status_code,401)
+                    self.assertIsNone(server.issue(121))
+                    self.assertEqual(client.get(path,headers=admin).json()["user"]["frozen"],1)
+                    self.assertEqual(client.post(path+"/freeze",headers=admin,json={**freeze,"request_id":"1"*32,"frozen":False}).status_code,200)
+                    self.assertEqual(client.get("/v1/me",headers=h).status_code,401)
+                    _,newcode=server.issue(121)
+                    self.assertEqual(client.post("/v1/auth/verify",json={"number":n,"code":newcode}).status_code,200)
+                    profile=client.get(path,headers=admin).json()
+                    self.assertEqual(profile["user"]["balance"],1300)
+                    self.assertEqual(profile["user"]["frozen"],0)
+                    self.assertEqual(len(profile["gifts"]),1)
+                    self.assertEqual(len(profile["audit"]),5)
+            finally:
+                server.ADMIN_KEY=previous
+
+
 if __name__=="__main__":
     unittest.main()
