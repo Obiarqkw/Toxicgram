@@ -110,6 +110,23 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(res.status_code,200)
                 self.assertEqual(client.get("/v1/gifts",headers=ha).json()["balance"],950)
                 self.assertEqual(client.get("/v1/gifts",headers=hb).json()["received"][0]["serial"],res.json()["serial"])
+                order={"recipient":b,"kind":"cake","request_id":"test-order-1","anonymous":True,"message":"Hello"}
+                first=client.post("/v1/gifts",headers=ha,json=order)
+                second=client.post("/v1/gifts",headers=ha,json=order)
+                self.assertEqual(first.status_code,200)
+                self.assertEqual(first.json(),second.json())
+                self.assertEqual(client.get("/v1/gifts",headers=ha).json()["balance"],830)
+                own=client.get("/v1/users/"+b+"/gifts",headers=hb).json()["received"]
+                self.assertEqual(len(own),2)
+                self.assertNotIn("sender",own[0])
+                gid=own[0]["id"]
+                self.assertEqual(client.get("/v1/users/"+b+"/gifts",headers=hc).json()["received"],[])
+                self.assertEqual(client.put(f"/v1/gifts/{gid}/visibility",headers=hc,json={"visible":True}).status_code,404)
+                self.assertEqual(client.put(f"/v1/gifts/{gid}/visibility",headers=hb,json={"visible":True}).status_code,200)
+                public=client.get("/v1/users/"+b+"/gifts",headers=hc).json()["received"]
+                self.assertEqual(len(public),1)
+                self.assertNotIn("sender",public[0])
+                self.assertEqual(public[0]["serial"],first.json()["serial"])
                 client.post("/v1/messages",headers=ha,json={"recipient":b,"text":"hi"})
                 sid=client.post("/v1/stories",headers=ha,json={"text":"story"}).json()["id"]
                 self.assertEqual(len(client.get("/v1/stories",headers=hb).json()["stories"]),1)
