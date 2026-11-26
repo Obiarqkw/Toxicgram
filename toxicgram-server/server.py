@@ -182,7 +182,9 @@ def poll(stop):
                         phone=phone_for(n,prefix)
                         reply=f"Toxicgram\nВаш виртуальный номер: {phone}\nКод Toxicgram: {code}\nДействует 5 минут. Не пересылайте код.\nТолько для Toxicgram, не настоящий телефон.\nПрефикс: /number +7, /number +1, /number +388.\nСтарый ID: {n}"
                     else:
-                        reply="Подождите 30 секунд перед запросом нового кода."
+                        with db() as conn:
+                            frozen=conn.execute("SELECT 1 FROM account_freezes f JOIN accounts a ON a.number=f.number WHERE a.telegram_id=?",(sender["id"],)).fetchone()
+                        reply="Ваш аккаунт Toxicgram заморожен. Обратитесь к администратору." if frozen else "Подождите 30 секунд перед запросом нового кода."
                 else:
                     reply="Используйте /code для получения кода Toxicgram."
                 api("sendMessage",{"chat_id":chat["id"],"text":reply,"protect_content":True})
@@ -696,7 +698,7 @@ def admin_auth(request):
 
 @app.get("/admin",response_class=HTMLResponse)
 def admin_page():
-    return HTMLResponse(Path(__file__).with_name("admin.html").read_text(encoding="utf-8"),headers={"Cache-Control":"no-store","Content-Security-Policy":"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer"})
+    return HTMLResponse(Path(__file__).with_name("admin.html").read_text(encoding="utf-8"),headers={"Cache-Control":"no-store","Content-Security-Policy":"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer"})
 
 @app.get("/admin/app.js")
 def admin_js():
