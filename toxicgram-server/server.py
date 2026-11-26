@@ -26,6 +26,10 @@ def init():
         CREATE TABLE IF NOT EXISTS accounts (telegram_id INTEGER PRIMARY KEY, number TEXT UNIQUE NOT NULL, code_hash TEXT, expires INTEGER DEFAULT 0, issued INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, number TEXT NOT NULL, expires INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS limits (key TEXT PRIMARY KEY, window INTEGER, count INTEGER);
+        CREATE TABLE IF NOT EXISTS profiles (number TEXT PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS msg_sender_recipient ON messages(sender,recipient,id);
+        CREATE INDEX IF NOT EXISTS msg_recipient_sender ON messages(recipient,sender,id);
         """)
 
 def digest(s):
@@ -167,3 +171,97 @@ def logout(request:Request):
     with db() as c:
         c.execute("DELETE FROM sessions WHERE token_hash=?",(key,))
     return {"ok":True}
+
+class ProfileUpdate(BaseModel):
+    name: str = Field(min_length=1,max_length=64)
+
+class MessageCreate(BaseModel):
+    recipient: str = Field(max_length=32)
+    text: str = Field(min_length=1,max_length=4000)
+
+def normalize_number(value):
+    value=value.strip().upper()
+    if not re.fullmatch(r"TG-[0-9]{4}-[0-9]{4}",value):
+        raise HTTPException(400,"Invalid Toxicgram number")
+    return value
+
+def require_peer(c, number):
+    if not c.execute("SELECT 1 FROM accounts WHERE number=?",(number,)).fetchone():
+        raise HTTPException(404,"Account not found")
+
+@app.get("/v1/profile")
+def profile(request:Request):
+    _,n=session(request)
+    with db() as c:
+        row=c.execute("SELECT name FROM profiles WHERE number=?",(n,)).fetchone()
+    return {"number":n,"name":row["name"] if row else n}
+
+@app.put("/v1/profile")
+def update_profile(body:ProfileUpdate,request:Request):
+    _,n=session(request)
+    name=body.name.strip()
+    if not name:
+        raise HTTPException(400,"Empty name")
+    with db() as c:
+        c.execute("INSERT INTO profiles VALUES (?,?) ON CONFLICT(number) DO UPDATE SET name=excluded.name",(n,name))
+    return {"number":n,"name":name}
+
+@app.get("/v1/users/{number}")
+def lookup(number:str,request:Request):
+    _,n=session(request)
+    if not allow("lookup:"+n):
+        raise HTTPException(429,"Too many requests")
+    peer=normalize_number(number)
+    with db() as c:
+        require_peer(c,peer)
+        row=c.execute("SELECT name FROM profiles WHERE number=?",(peer,)).fetchone()
+    return {"number":peer,"name":row["name"] if row else peer}
+
+@app.get("/v1/chats")
+def chats(request:Request):
+    _,n=session(request)
+    with db() as c:
+        rows=c.execute("""
+        WITH relevant AS (
+          SELECT *, CASE WHEN sender=? THEN recipient ELSE sender END AS peer
+          FROM messages WHERE sender=? OR recipient=?
+        ), latest AS (SELECT peer,MAX(id) AS id FROM relevant GROUP BY peer)
+        SELECT r.peer AS number,COALESCE(p.name,r.peer) AS name,r.body AS text,r.created,r.id
+        FROM latest l JOIN relevant r ON r.id=l.id LEFT JOIN profiles p ON p.number=r.peer
+        ORDER BY r.id DESC LIMIT 100
+        """,(n,n,n)).fetchall()
+    return {"chats":[dict(row) for row in rows]}
+
+@app.get("/v1/chats/{number}/messages")
+def history(number:str,request:Request,after:int=0,before:int=0):
+    _,n=session(request)
+    peer=normalize_number(number)
+    if after<0 or before<0 or (after and before):
+        raise HTTPException(400,"Invalid cursor")
+    with db() as c:
+        require_peer(c,peer)
+        base="SELECT id,sender,recipient,body AS text,created FROM messages WHERE ((sender=? AND recipient=?) OR (sender=? AND recipient=?))"
+        args=(n,peer,peer,n)
+        if after:
+            rows=c.execute(base+" AND id>? ORDER BY id ASC LIMIT 100",args+(after,)).fetchall()
+        elif before:
+            rows=list(reversed(c.execute(base+" AND id<? ORDER BY id DESC LIMIT 100",args+(before,)).fetchall()))
+        else:
+            rows=list(reversed(c.execute(base+" ORDER BY id DESC LIMIT 100",args).fetchall()))
+    return {"messages":[dict(row) for row in rows]}
+
+@app.post("/v1/messages")
+def send(body:MessageCreate,request:Request):
+    _,n=session(request)
+    if not allow("send:"+n):
+        raise HTTPException(429,"Too many messages")
+    peer=normalize_number(body.recipient)
+    value=body.text.strip()
+    if not value:
+        raise HTTPException(400,"Empty message")
+    now=int(time.time())
+    with db() as c:
+        require_peer(c,peer)
+        cur=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,value,now))
+        mid=cur.lastrowid
+    return {"id":mid,"sender":n,"recipient":peer,"text":value,"created":now}
