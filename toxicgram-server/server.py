@@ -57,6 +57,10 @@ def init():
         CREATE TABLE IF NOT EXISTS catalog_gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT UNIQUE NOT NULL, name TEXT NOT NULL, emoji TEXT NOT NULL DEFAULT '', price INTEGER NOT NULL, supply INTEGER NOT NULL DEFAULT 0, issued INTEGER NOT NULL DEFAULT 0, rarity TEXT NOT NULL DEFAULT 'common', upgrade_enabled INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, art TEXT NOT NULL DEFAULT '', asset TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS gift_art (id TEXT PRIMARY KEY, data BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS gift_numbers (gift_id INTEGER PRIMARY KEY, num INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS account_freezes (number TEXT PRIMARY KEY, reason TEXT NOT NULL, created INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS admin_user_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, reason TEXT NOT NULL, created INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS admin_user_action_number ON admin_user_actions(number,id);
+        CREATE TABLE IF NOT EXISTS admin_user_requests (request_id TEXT PRIMARY KEY, signature TEXT NOT NULL, result TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS admin_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, kind TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS stories (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, text TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS story_owner ON stories(owner,created);
@@ -99,6 +103,9 @@ def issue(tid):
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute("SELECT * FROM accounts WHERE telegram_id=?", (tid,)).fetchone()
+        if row and c.execute("SELECT 1 FROM account_freezes WHERE number=?",(row["number"],)).fetchone():
+            c.rollback()
+            return None
         if row and now-row["issued"]<30:
             c.rollback()
             return None
@@ -121,7 +128,7 @@ def consume(n,code):
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute("SELECT * FROM accounts WHERE number=?", (n,)).fetchone()
-        if not row or not row["code_hash"] or row["expires"]<=now or row["attempts"]>=5:
+        if not row or c.execute("SELECT 1 FROM account_freezes WHERE number=?",(n,)).fetchone() or not row["code_hash"] or row["expires"]<=now or row["attempts"]>=5:
             c.rollback()
             return None
         if not hmac.compare_digest(row["code_hash"],digest(n+":"+code)):
@@ -225,7 +232,7 @@ def session(request):
         raise HTTPException(401,"Unauthorized")
     key=digest(token)
     with db() as c:
-        row=c.execute("SELECT number FROM sessions WHERE token_hash=? AND expires>?",(key,int(time.time()))).fetchone()
+        row=c.execute("SELECT s.number FROM sessions s WHERE s.token_hash=? AND s.expires>? AND NOT EXISTS(SELECT 1 FROM account_freezes f WHERE f.number=s.number)",(key,int(time.time()))).fetchone()
     if not row:
         raise HTTPException(401,"Unauthorized")
     return key,row["number"]
@@ -704,6 +711,146 @@ def admin_catalog(request:Request):
     admin_auth(request)
     with db() as c:
         return {"catalog":catalog_rows(c,True),"stats":{"users":c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0],"gifts":c.execute("SELECT COUNT(*) FROM gifts").fetchone()[0],"stars":c.execute("SELECT COALESCE(SUM(balance),0) FROM wallets").fetchone()[0]}}
+
+
+# Admin access is separate from ordinary user sessions. Never include bot IDs,
+# login codes, access tokens, private messages or contact lists in the admin UI.
+ADMIN_USER_SELECT = """
+SELECT a.number, COALESCE(p.name,ph.phone,a.number) AS name,
+       COALESCE(ph.phone,'') AS phone,COALESCE(pd.username,'') AS username,
+       COALESCE(pd.bio,'') AS bio,COALESCE(av.media_id,'') AS avatar,
+       COALESCE(w.balance,1000) AS balance,
+       CASE WHEN f.number IS NULL THEN 0 ELSE 1 END AS frozen,
+       COALESCE(f.reason,'') AS freeze_reason,COALESCE(f.created,0) AS frozen_at,
+       (SELECT COUNT(*) FROM gifts g WHERE g.recipient=a.number) AS gift_count
+FROM accounts a LEFT JOIN profiles p ON p.number=a.number
+LEFT JOIN phone_aliases ph ON ph.number=a.number
+LEFT JOIN profile_details pd ON pd.number=a.number
+LEFT JOIN avatars av ON av.number=a.number
+LEFT JOIN wallets w ON w.number=a.number
+LEFT JOIN account_freezes f ON f.number=a.number
+"""
+
+@app.get("/v1/admin/users")
+def admin_users(request:Request,q:str="",after:str="",limit:int=30):
+    admin_auth(request)
+    limit=max(1,min(100,limit))
+    term=q.strip()[:100].lstrip("@").lower()
+    with db() as c:
+        rows=c.execute(ADMIN_USER_SELECT+"""
+        WHERE a.number>? AND (?='' OR instr(lower(a.number),?)>0 OR
+        instr(lower(COALESCE(p.name,'')),?)>0 OR
+        instr(lower(COALESCE(pd.username,'')),?)>0 OR
+        instr(COALESCE(ph.phone,''),?)>0)
+        ORDER BY a.number LIMIT ?
+        """,(after[:40],term,term,term,term,term,limit+1)).fetchall()
+    return {"users":[dict(x) for x in rows[:limit]],"next":rows[limit-1]["number"] if len(rows)>limit else ""}
+
+@app.get("/v1/admin/users/{number}")
+def admin_user(number:str,request:Request):
+    admin_auth(request)
+    with db() as c:
+        user=c.execute(ADMIN_USER_SELECT+" WHERE a.number=?",(number,)).fetchone()
+        if not user: raise HTTPException(404,"Account not found")
+        gifts=c.execute("""SELECT g.id,g.kind,g.serial,g.created,gn.num,
+          COALESCE(cg.name,g.kind) AS name,COALESCE(cg.emoji,'') AS emoji,
+          COALESCE(d.visible,0) AS visible
+          FROM gifts g LEFT JOIN gift_numbers gn ON gn.gift_id=g.id
+          LEFT JOIN catalog_gifts cg ON cg.kind=g.kind
+          LEFT JOIN gift_details d ON d.gift_id=g.id
+          WHERE g.recipient=? ORDER BY g.id DESC LIMIT 100""",(number,)).fetchall()
+        audit=c.execute("SELECT action,detail,reason,created FROM admin_user_actions WHERE number=? ORDER BY id DESC LIMIT 50",(number,)).fetchall()
+    return {"user":dict(user),"gifts":[dict(x) for x in gifts],"audit":[dict(x) for x in audit]}
+
+@app.get("/v1/admin/users/{number}/avatar")
+def admin_avatar(number:str,request:Request):
+    admin_auth(request)
+    with db() as c:
+        row=c.execute("SELECT m.mime,m.content FROM avatars a JOIN media m ON m.id=a.media_id WHERE a.number=?",(number,)).fetchone()
+    if not row or row["mime"] not in ("image/jpeg","image/png","image/webp"): raise HTTPException(404,"Avatar not found")
+    return Response(row["content"],media_type=row["mime"],headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+
+class AdminAction(BaseModel):
+    request_id:str=Field(pattern=r"^[a-f0-9-]{16,64}$")
+    reason:str=Field(min_length=1,max_length=250)
+
+class AdminStars(AdminAction):
+    delta:int=Field(ge=-100000000,le=100000000)
+
+class AdminGift(AdminAction):
+    kind:str=Field(min_length=1,max_length=24)
+
+class AdminFreeze(AdminAction):
+    frozen:bool
+
+def admin_replay(c,number,action,body):
+    sig=hashlib.sha256(json.dumps([number,action,body.model_dump()],sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    prev=c.execute("SELECT signature,result FROM admin_user_requests WHERE request_id=?",(body.request_id,)).fetchone()
+    if prev and prev["signature"]!=sig: raise HTTPException(409,"Request ID already used")
+    return sig,json.loads(prev["result"]) if prev else None
+
+def admin_finish(c,number,action,body,sig,result):
+    c.execute("INSERT INTO admin_user_actions(number,action,detail,reason,created) VALUES (?,?,?,?,?)",(number,action,json.dumps(result,ensure_ascii=False),body.reason.strip(),int(time.time())))
+    c.execute("INSERT INTO admin_user_requests VALUES (?,?,?)",(body.request_id,sig,json.dumps(result,ensure_ascii=False)))
+    c.commit()
+    return result
+
+@app.post("/v1/admin/users/{number}/stars")
+def admin_stars(number:str,body:AdminStars,request:Request):
+    admin_auth(request)
+    if not body.delta or not body.reason.strip(): raise HTTPException(400,"Specify amount and reason")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        require_peer(c,number)
+        sig,prev=admin_replay(c,number,"stars.adjust",body)
+        if prev is not None: return prev
+        c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(number,))
+        before=c.execute("SELECT balance FROM wallets WHERE number=?",(number,)).fetchone()[0]
+        after=before+body.delta
+        if not 0<=after<=1000000000: raise HTTPException(409,"Balance outside allowed range")
+        c.execute("UPDATE wallets SET balance=? WHERE number=?",(after,number))
+        return admin_finish(c,number,"stars.adjust",body,sig,{"ok":True,"before":before,"delta":body.delta,"balance":after})
+
+@app.post("/v1/admin/users/{number}/gift")
+def admin_grant_gift(number:str,body:AdminGift,request:Request):
+    admin_auth(request)
+    if not body.reason.strip(): raise HTTPException(400,"Specify reason")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        require_peer(c,number)
+        sig,prev=admin_replay(c,number,"gift.grant",body)
+        if prev is not None: return prev
+        item=c.execute("SELECT * FROM catalog_gifts WHERE kind=?",(body.kind,)).fetchone()
+        if not item: raise HTTPException(404,"Gift not found")
+        if item["supply"] and item["issued"]>=item["supply"]: raise HTTPException(410,"Sold out")
+        serial=secrets.token_hex(8)
+        # No wallet debit; the administrative sender is intentionally anonymous.
+        gid=c.execute("INSERT INTO gifts(sender,recipient,kind,created,serial) VALUES (?,?,?,?,?)",("ADMIN",number,body.kind,int(time.time()),serial)).lastrowid
+        num=item["issued"]+1
+        c.execute("UPDATE catalog_gifts SET issued=issued+1 WHERE id=?",(item["id"],))
+        c.execute("INSERT INTO gift_numbers VALUES (?,?)",(gid,num))
+        c.execute("INSERT INTO gift_details(gift_id,visible,anonymous,message) VALUES (?,0,1,?)",(gid,"Toxicgram"))
+        return admin_finish(c,number,"gift.grant",body,sig,{"ok":True,"kind":body.kind,"gift_id":gid,"serial":serial,"num":num})
+
+@app.post("/v1/admin/users/{number}/freeze")
+def admin_freeze(number:str,body:AdminFreeze,request:Request):
+    admin_auth(request)
+    if not body.reason.strip(): raise HTTPException(400,"Specify reason")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        require_peer(c,number)
+        action="account.freeze" if body.frozen else "account.unfreeze"
+        sig,prev=admin_replay(c,number,action,body)
+        if prev is not None: return prev
+        if body.frozen:
+            c.execute("INSERT INTO account_freezes VALUES (?,?,?) ON CONFLICT(number) DO UPDATE SET reason=excluded.reason,created=excluded.created",(number,body.reason.strip(),int(time.time())))
+            c.execute("DELETE FROM sessions WHERE number=?",(number,))
+            c.execute("UPDATE accounts SET code_hash=NULL,expires=0,attempts=0 WHERE number=?",(number,))
+        else:
+            c.execute("DELETE FROM account_freezes WHERE number=?",(number,))
+            # A fresh login is required after unfreezing.
+            c.execute("UPDATE accounts SET issued=0 WHERE number=?",(number,))
+        return admin_finish(c,number,action,body,sig,{"ok":True,"frozen":body.frozen})
 
 class CatalogEdit(BaseModel):
     kind:str=Field(pattern=r"^[a-z0-9][a-z0-9-]{0,23}$")
