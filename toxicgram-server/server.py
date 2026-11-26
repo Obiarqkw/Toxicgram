@@ -40,6 +40,8 @@ def init():
         CREATE TABLE IF NOT EXISTS message_edits (message_id INTEGER PRIMARY KEY, edited INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS phone_aliases (number TEXT PRIMARY KEY, phone TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS used_phones (phone TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS presence (number TEXT PRIMARY KEY, last_seen INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS msg_incoming_cursor ON messages(recipient,id);
         CREATE TABLE IF NOT EXISTS profile_names (number TEXT PRIMARY KEY, first_name TEXT NOT NULL, last_name TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS room_meta (numeric_id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT UNIQUE NOT NULL, about TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL DEFAULT 'basic', created INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS profile_details (number TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE, bio TEXT NOT NULL DEFAULT '');
@@ -368,7 +370,9 @@ def lookup(number:str,request:Request):
     with db() as c:
         require_peer(c,peer)
         pass
-    return public_profile(peer)
+    p=public_profile(peer)
+    with db() as c:p.update(visible_presence(c,n,peer))
+    return p
 
 @app.get("/v1/chats")
 def chats(request:Request):
@@ -390,9 +394,56 @@ def chats(request:Request):
         p=public_profile(item["number"])
         item["phone"]=p["phone"]
         item["avatar"]=p["avatar"]
+        item["first_name"]=p["first_name"]
+        item["last_name"]=p["last_name"]
+        item["username"]=p["username"]
+        with db() as c:
+            seen=visible_presence(c,n,item["number"])
+        item.update(seen)
         if item["name"]==item["number"]: item["name"]=item["phone"]
         result.append(item)
     return {"chats":result}
+
+def visible_presence(c,viewer,peer):
+    # Exact presence is shared only with existing conversation partners, never blocked accounts.
+    if viewer!=peer and (not c.execute("SELECT 1 FROM messages WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?) LIMIT 1",(viewer,peer,peer,viewer)).fetchone() or c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(viewer,peer,peer,viewer)).fetchone()):
+        return {"last_seen":0,"online_until":0}
+    row=c.execute("SELECT last_seen FROM presence WHERE number=? AND NOT EXISTS(SELECT 1 FROM account_freezes WHERE number=?)",(peer,peer)).fetchone()
+    seen=row["last_seen"] if row else 0
+    return {"last_seen":seen,"online_until":seen+25 if seen else 0}
+
+@app.get("/v1/sync")
+def sync_messages(request:Request,after:int=0):
+    _,n=session(request)
+    if after<0:raise HTTPException(400,"Invalid cursor")
+    now=int(time.time())
+    with db() as c:
+        c.execute("INSERT INTO presence VALUES (?,?) ON CONFLICT(number) DO UPDATE SET last_seen=excluded.last_seen",(n,now))
+        rows=c.execute("""SELECT m.id,m.sender,m.recipient,m.body AS text,m.created,COALESCE(e.edited,0) AS edited
+          FROM messages m LEFT JOIN message_edits e ON e.message_id=m.id
+          WHERE m.recipient=? AND m.sender<>? AND m.id>?
+          AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.owner=? AND h.message_id=m.id)
+          AND (?<>0 OR m.id>COALESCE((SELECT rs.last_id FROM read_state rs WHERE rs.owner=? AND rs.peer=m.sender),0))
+          ORDER BY m.id LIMIT 101""",(n,n,after,n,after,n)).fetchall()
+        batch=rows[:100]
+        cursor=batch[-1]["id"] if batch else max(after,c.execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE recipient=?",(n,)).fetchone()[0])
+        peers=c.execute("""SELECT peer,MAX(id) AS latest FROM (
+          SELECT sender AS peer,id FROM messages WHERE recipient=? AND sender<>?
+          UNION ALL SELECT recipient AS peer,id FROM messages WHERE sender=? AND recipient<>?)
+          GROUP BY peer ORDER BY latest DESC LIMIT 100""",(n,n,n,n)).fetchall()
+        numbers=set(x["peer"] for x in peers)|set(x["sender"] for x in batch)
+        statuses=[]
+        for peer in numbers:
+            st=visible_presence(c,n,peer)
+            read=c.execute("SELECT last_id FROM read_state WHERE owner=? AND peer=?",(peer,n)).fetchone()
+            inbox=c.execute("SELECT last_id FROM read_state WHERE owner=? AND peer=?",(n,peer)).fetchone()
+            statuses.append({"number":peer,**st,"read_outbox":read["last_id"] if read else 0,"read_inbox":inbox["last_id"] if inbox else 0})
+    profiles=[]
+    for peer in set(x["sender"] for x in batch):
+        p=public_profile(peer)
+        st=next((x for x in statuses if x["number"]==peer),{})
+        p.update(st);profiles.append(p)
+    return {"messages":[dict(x) for x in batch],"users":profiles,"statuses":statuses,"cursor":cursor,"more":len(rows)>100,"server_time":now}
 
 @app.get("/v1/chats/{number}/messages")
 def history(number:str,request:Request,after:int=0,before:int=0):
