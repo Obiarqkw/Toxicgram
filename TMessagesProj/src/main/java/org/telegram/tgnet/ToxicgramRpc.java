@@ -149,23 +149,34 @@ public final class ToxicgramRpc {
     private static final String[] GIFT_KINDS={"heart","bear","rose","star","crystal","present","cake"};
     private static final String[] GIFT_ART={"email_setup_heart","gift","gift","star_reaction","wallet_diamond_blue","gift","cake"};
     private static final long GIFT_BASE=830000000000000000L;
-    private static int giftIndex(String kind)throws ApiError{
-        for(int i=0;i<GIFT_KINDS.length;i++)if(GIFT_KINDS[i].equals(kind))return i;
+    private static long catalogId(JSONObject row)throws Exception{
+        if(row.has("gift_id"))return Long.parseLong(row.getString("gift_id"));
+        for(int i=0;i<GIFT_KINDS.length;i++)if(GIFT_KINDS[i].equals(row.getString("kind")))return GIFT_BASE+i;
         throw new ApiError(400,"STARGIFT_INVALID");
     }
-    private static String giftKind(long id)throws ApiError{
-        long i=id-GIFT_BASE;
-        if(i<0||i>=GIFT_KINDS.length)throw new ApiError(400,"STARGIFT_INVALID");
-        return GIFT_KINDS[(int)i];
+    private static JSONObject findGiftId(JSONArray catalog,long id)throws Exception{
+        for(int i=0;i<catalog.length();i++){JSONObject row=catalog.getJSONObject(i);if(catalogId(row)==id)return row;}
+        throw new ApiError(400,"STARGIFT_INVALID");
     }
-    // Local upstream Lottie files, not Telegram server-hosted NFT models.
+    private static File artDir(){
+        return new File(ApplicationLoader.applicationContext.getCacheDir(),"toxicgram_gift_art");
+    }
+    private static android.content.SharedPreferences artPrefs(){
+        return ApplicationLoader.applicationContext.getSharedPreferences("toxicgram_gift_art",0);
+    }
     public static synchronized String giftAnimationPath(long id){
         long index=id-GIFT_BASE;
-        if(index<0||index>=GIFT_ART.length)return null;
+        if(index<0||index>=1000000)return null;
         try{
-            String art=GIFT_ART[(int)index];
-            File dir=new File(ApplicationLoader.applicationContext.getCacheDir(),"toxicgram_gift_art");
+            File dir=artDir();
             if(!dir.isDirectory()&&!dir.mkdirs())return null;
+            String asset=artPrefs().getString(Long.toString(id),"");
+            if(asset.matches("[a-f0-9]{64}")){
+                File f=new File(dir,asset+".tgs");
+                if(f.isFile())return f.getAbsolutePath();
+            }
+            if(index>=GIFT_ART.length)return null;
+            String art=GIFT_ART[(int)index];
             File target=new File(dir,art+".tgs");
             if(!target.exists()){
                 int resource=ApplicationLoader.applicationContext.getResources().getIdentifier(art,"raw",ApplicationLoader.applicationContext.getPackageName());
@@ -180,17 +191,40 @@ public final class ToxicgramRpc {
             return target.getAbsolutePath();
         }catch(Exception e){return null;}
     }
+    private static void downloadGiftArt(long id,String asset)throws Exception{
+        if(!asset.matches("[a-f0-9]{64}"))throw new IOException("Invalid gift asset");
+        File dir=artDir();if(!dir.isDirectory()&&!dir.mkdirs())throw new IOException("Cannot create artwork cache");
+        File target=new File(dir,asset+".tgs");
+        if(!target.isFile()){
+            HttpsURLConnection conn=(HttpsURLConnection)new URL(BASE+"/v1/gift-art/"+asset).openConnection();
+            try{
+                conn.setConnectTimeout(10000);conn.setReadTimeout(15000);conn.setInstanceFollowRedirects(false);
+                if(conn.getResponseCode()!=200)throw new IOException("Artwork unavailable");
+                ByteArrayOutputStream bytes=new ByteArrayOutputStream();
+                try(InputStream in=conn.getInputStream()){byte[] b=new byte[8192];int n;while((n=in.read(b))!=-1){if(bytes.size()+n>262144)throw new IOException("Artwork too large");bytes.write(b,0,n);}}
+                byte[] data=bytes.toByteArray();byte[] digest=java.security.MessageDigest.getInstance("SHA-256").digest(data);StringBuilder hex=new StringBuilder();
+                for(byte b:digest)hex.append(String.format(Locale.US,"%02x",b&255));
+                if(!asset.equals(hex.toString()))throw new IOException("Artwork hash mismatch");
+                File tmp=new File(dir,asset+".tmp");try(FileOutputStream out=new FileOutputStream(tmp)){out.write(data);}
+                if(!tmp.renameTo(target)){tmp.delete();throw new IOException("Artwork cache error");}
+            }finally{conn.disconnect();}
+        }
+        artPrefs().edit().putString(Long.toString(id),asset).apply();
+    }
     private static TL_stars.TL_starGift gift(JSONObject row)throws Exception{
-        int index=giftIndex(row.getString("kind"));
-        TL_stars.TL_starGift g=new TL_stars.TL_starGift();g.id=GIFT_BASE+index;g.stars=row.getLong("price");
-        g.convert_stars=0;g.can_upgrade=false;
+        TL_stars.TL_starGift g=new TL_stars.TL_starGift();g.id=catalogId(row);g.stars=row.getLong("price");
+        g.convert_stars=0;g.can_upgrade=false; // Upgrade workflow is not yet supported by the original UI adapter.
+        int supply=row.optInt("supply");
+        if(supply>0){g.limited=true;g.availability_total=supply;g.availability_remains=row.optInt("remaining");g.sold_out=g.availability_remains<=0;}
+        String asset=row.optString("asset","");
+        if(!asset.isEmpty())downloadGiftArt(g.id,asset);
         TLRPC.TL_document d=new TLRPC.TL_document();
         d.id=g.id;d.access_hash=g.id;d.file_reference=new byte[0];d.date=1;d.mime_type="application/x-tgsticker";d.dc_id=1;
         String local=giftAnimationPath(d.id);
         d.size=local==null?0:new File(local).length();
         TLRPC.TL_documentAttributeSticker sticker=new TLRPC.TL_documentAttributeSticker();sticker.alt=row.optString("emoji","");sticker.stickerset=new TLRPC.TL_inputStickerSetEmpty();
         d.attributes.add(sticker);
-        TLRPC.TL_documentAttributeFilename filename=new TLRPC.TL_documentAttributeFilename();filename.file_name=GIFT_ART[index]+".tgs";d.attributes.add(filename);
+        TLRPC.TL_documentAttributeFilename filename=new TLRPC.TL_documentAttributeFilename();filename.file_name="toxicgram-gift.tgs";d.attributes.add(filename);
         TLRPC.TL_documentAttributeImageSize dims=new TLRPC.TL_documentAttributeImageSize();dims.w=512;dims.h=512;d.attributes.add(dims);
         g.sticker=d;return g;
     }
@@ -199,32 +233,33 @@ public final class ToxicgramRpc {
         throw new ApiError(400,"STARGIFT_INVALID");
     }
     private static final class GiftOrder{
-        final int account;final String recipient,kind,message;final boolean anonymous;final long expires;
-        GiftOrder(int a,String r,String k,String m,boolean h){account=a;recipient=r;kind=k;message=m;anonymous=h;expires=System.currentTimeMillis()+600000;}
+        final int account;final String recipient,kind,message;final boolean anonymous;final long expires,price,giftId;
+        GiftOrder(int a,String r,String k,String m,boolean h,long p,long g){account=a;recipient=r;kind=k;message=m;anonymous=h;price=p;giftId=g;expires=System.currentTimeMillis()+600000;}
     }
     private static final java.util.Map<Long,GiftOrder> orders=new java.util.HashMap<>();
     private static TLObject gifts(int a,TLObject req)throws Exception{
         if(req instanceof TL_stars.getStarGifts){
-            JSONArray catalog=http("GET","/v1/gifts",null,token(a)).getJSONArray("catalog");
+            JSONArray catalog=http("GET","/v1/gifts?dynamic=true",null,token(a)).getJSONArray("catalog");
             TL_stars.TL_starGifts result=new TL_stars.TL_starGifts();result.hash=2;
-            for(int i=0;i<catalog.length();i++){JSONObject row=catalog.getJSONObject(i);if(!row.optString("art","").isEmpty())result.gifts.add(gift(row));}
+            for(int i=0;i<catalog.length();i++){JSONObject row=catalog.getJSONObject(i);if(row.optInt("active",1)!=0&&(!row.optString("art","").isEmpty()||!row.optString("asset","").isEmpty())){try{result.gifts.add(gift(row));}catch(Exception ignored){/* One bad asset must not hide the whole catalog. */}}}
             return result;
         }
         if(req instanceof TL_stars.TL_payments_getStarsStatus){
             TL_stars.TL_payments_getStarsStatus q=(TL_stars.TL_payments_getStarsStatus)req;
             if(q.ton||!peer(a,q.peer).equals(prefs(a).getString("number","")))throw new ApiError(501,"TOXICGRAM_METHOD_NOT_IMPLEMENTED");
             TL_stars.TL_payments_starsStatus result=new TL_stars.TL_payments_starsStatus();
-            result.balance=TL_stars.StarsAmount.ofStars(http("GET","/v1/gifts",null,token(a)).getLong("balance"));return result;
+            result.balance=TL_stars.StarsAmount.ofStars(http("GET","/v1/gifts?dynamic=true",null,token(a)).getLong("balance"));return result;
         }
         if(req instanceof TLRPC.TL_payments_getPaymentForm && ((TLRPC.TL_payments_getPaymentForm)req).invoice instanceof TLRPC.TL_inputInvoiceStarGift){
             TLRPC.TL_inputInvoiceStarGift invoice=(TLRPC.TL_inputInvoiceStarGift)((TLRPC.TL_payments_getPaymentForm)req).invoice;
             if(invoice.include_upgrade)throw new ApiError(501,"TOXICGRAM_UPGRADE_NOT_IMPLEMENTED");
-            String kind=giftKind(invoice.gift_id),recipient=peer(a,invoice.peer);
-            JSONObject row=findGift(http("GET","/v1/gifts",null,token(a)).getJSONArray("catalog"),kind);
+            String recipient=peer(a,invoice.peer);
+            JSONObject row=findGiftId(http("GET","/v1/gifts?dynamic=true",null,token(a)).getJSONArray("catalog"),invoice.gift_id);
+            String kind=row.getString("kind");if(row.optInt("active",1)==0||row.optInt("supply")>0&&row.optInt("remaining")==0)throw new ApiError(400,"STARGIFT_USAGE_LIMITED");
             long id=new java.security.SecureRandom().nextLong()&Long.MAX_VALUE;
             orders.entrySet().removeIf(e->e.getValue().expires<System.currentTimeMillis());
             if(orders.size()>1000)throw new ApiError(429,"FLOOD_WAIT_60");
-            orders.put(id,new GiftOrder(a,recipient,kind,invoice.message==null?"":invoice.message.text,invoice.hide_name));
+            orders.put(id,new GiftOrder(a,recipient,kind,invoice.message==null?"":invoice.message.text,invoice.hide_name,row.getLong("price"),invoice.gift_id));
             TLRPC.TL_payments_paymentFormStarGift form=new TLRPC.TL_payments_paymentFormStarGift();
             form.form_id=id;form.invoice=new TLRPC.TL_invoice();form.invoice.currency="XTR";
             TLRPC.TL_labeledPrice price=new TLRPC.TL_labeledPrice();price.label=row.optString("name");price.amount=row.getLong("price");form.invoice.prices.add(price);
@@ -235,9 +270,9 @@ public final class ToxicgramRpc {
             if(!(send.invoice instanceof TLRPC.TL_inputInvoiceStarGift))throw new ApiError(501,"TOXICGRAM_METHOD_NOT_IMPLEMENTED");
             TLRPC.TL_inputInvoiceStarGift invoice=(TLRPC.TL_inputInvoiceStarGift)send.invoice;
             GiftOrder order=orders.get(send.form_id);
-            if(order==null||order.account!=a||order.expires<System.currentTimeMillis()||!order.recipient.equals(peer(a,invoice.peer))||!order.kind.equals(giftKind(invoice.gift_id)))throw new ApiError(400,"FORM_EXPIRED");
-            try{http("POST","/v1/gifts",new JSONObject().put("kind",order.kind).put("recipient",order.recipient).put("request_id",Long.toString(send.form_id)).put("anonymous",order.anonymous).put("message",order.message),token(a));}
-            catch(ApiError e){if(e.code==409)throw new ApiError(400,"BALANCE_TOO_LOW");throw e;}
+            if(order==null||order.account!=a||order.expires<System.currentTimeMillis()||!order.recipient.equals(peer(a,invoice.peer))||order.giftId!=invoice.gift_id)throw new ApiError(400,"FORM_EXPIRED");
+            try{http("POST","/v1/gifts",new JSONObject().put("kind",order.kind).put("recipient",order.recipient).put("request_id",Long.toString(send.form_id)).put("anonymous",order.anonymous).put("message",order.message).put("expected_price",order.price),token(a));}
+            catch(ApiError e){if(e.code==409)throw new ApiError(400,"BALANCE_TOO_LOW");if(e.code==410)throw new ApiError(400,"STARGIFT_USAGE_LIMITED");if(e.code==412)throw new ApiError(400,"FORM_EXPIRED");throw e;}
             TLRPC.TL_payments_paymentResult result=new TLRPC.TL_payments_paymentResult();result.updates=new TLRPC.TL_updates();result.updates.date=(int)(System.currentTimeMillis()/1000L);return result;
         }
         if(req instanceof TL_stars.getSavedStarGifts){
@@ -246,7 +281,7 @@ public final class ToxicgramRpc {
             TL_stars.TL_payments_savedStarGifts result=new TL_stars.TL_payments_savedStarGifts();
             if(query.offset!=null&&!query.offset.isEmpty())return result;
             JSONArray received=http("GET","/v1/users/"+owner+"/gifts",null,t).getJSONArray("received");
-            JSONArray catalog=http("GET","/v1/gifts",null,t).getJSONArray("catalog");
+            JSONArray catalog=http("GET","/v1/gifts?dynamic=true",null,t).getJSONArray("catalog");
             for(int i=0;i<received.length();i++){
                 JSONObject row=received.getJSONObject(i);boolean visible=row.optInt("visible")!=0;
                 if((query.exclude_unsaved&&!visible)||(query.exclude_saved&&visible)||query.exclude_unlimited||query.exclude_unupgradable)continue;
