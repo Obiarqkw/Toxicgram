@@ -19,6 +19,7 @@ import org.telegram.tgnet.tl.TL_update;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.UserConfig;
+import org.telegram.messenger.FileLoader;
 import java.io.*;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -93,7 +94,7 @@ public final class ToxicgramRpc {
             JSONArray incoming=response.getJSONArray("messages"),profiles=response.getJSONArray("users"),statuses=response.getJSONArray("statuses");
             java.util.ArrayList<TLRPC.User> users=new java.util.ArrayList<>();
             java.util.ArrayList<TLRPC.Update> events=new java.util.ArrayList<>();
-            for(int i=0;i<profiles.length();i++)users.add(user(profiles.getJSONObject(i),false));
+            for(int i=0;i<profiles.length();i++)users.add(user(a,profiles.getJSONObject(i),false));
             // Read markers precede message delivery to avoid replaying already-read
             // messages as unread after a reconnect.
             for(int i=0;i<statuses.length();i++){
@@ -108,7 +109,7 @@ public final class ToxicgramRpc {
                 }
             }
             for(int i=0;i<incoming.length();i++){
-                TLRPC.TL_message m=message(incoming.getJSONObject(i),self);
+                TLRPC.TL_message m=message(a,incoming.getJSONObject(i),self);
                 // The conversation can already have been loaded from history.
                 if(MessagesStorage.getInstance(a).getMessage(m.peer_id.user_id,m.id)!=null)continue;
                 TL_update.TL_updateNewMessage event=new TL_update.TL_updateNewMessage();event.message=m;events.add(event);
@@ -199,13 +200,86 @@ public final class ToxicgramRpc {
         if(!number.matches("TG-[0-9]{4}-[0-9]{4}"))throw new IllegalArgumentException("Invalid internal identifier");
         return 100000000L+Long.parseLong(number.replaceAll("[^0-9]",""));
     }
-    private static TLRPC.TL_user user(JSONObject p,boolean self)throws Exception{
+    private static final java.util.Map<Long,StagedFile> staged=new java.util.concurrent.ConcurrentHashMap<>();
+    private static class StagedFile{
+        final int account;final File file;final long expires;
+        StagedFile(int a,File f){account=a;file=f;expires=System.currentTimeMillis()+3600000;}
+    }
+    public static TLRPC.InputFile stageUpload(int account,File file){
+        if(!file.isFile()||file.length()==0||file.length()>8*1024*1024)return null;
+        staged.entrySet().removeIf(x->x.getValue().expires<System.currentTimeMillis());
+        if(staged.size()>=300)return null;
+        long id=new java.security.SecureRandom().nextLong();
+        staged.put(id,new StagedFile(account,file));
+        TLRPC.TL_inputFile input=new TLRPC.TL_inputFile();input.id=id;input.parts=1;input.name=file.getName();input.md5_checksum="";
+        return input;
+    }
+    private static File stagedFile(int a,TLRPC.InputFile input)throws Exception{
+        StagedFile f=input==null?null:staged.get(input.id);
+        if(f==null||f.account!=a||f.expires<System.currentTimeMillis()||!f.file.isFile())throw new ApiError(400,"FILE_PARTS_INVALID");
+        return f.file;
+    }
+    private static JSONObject uploadBytes(int a,String method,String path,File file,int limit)throws Exception{
+        if(file.length()==0||file.length()>limit)throw new ApiError(400,"FILE_TOO_BIG");
+        HttpsURLConnection conn=(HttpsURLConnection)new URL(BASE+path).openConnection();
+        try{
+            conn.setConnectTimeout(15000);conn.setReadTimeout(30000);conn.setRequestMethod(method);conn.setInstanceFollowRedirects(false);
+            conn.setRequestProperty("Authorization","Bearer "+token(a));conn.setRequestProperty("Content-Type","application/octet-stream");conn.setDoOutput(true);conn.setFixedLengthStreamingMode((int)file.length());
+            try(InputStream in=new FileInputStream(file);OutputStream out=conn.getOutputStream()){byte[] b=new byte[32768];int n;while((n=in.read(b))!=-1)out.write(b,0,n);}
+            int status=conn.getResponseCode();if(status<200||status>=300)throw new ApiError(status,status==413?"FILE_TOO_BIG":status==507?"STORAGE_FULL":"TOXICGRAM_UPLOAD_FAILED");
+            try(InputStream in=conn.getInputStream();ByteArrayOutputStream out=new ByteArrayOutputStream()){byte[] b=new byte[4096];int n;while((n=in.read(b))!=-1){if(out.size()+n>65536)throw new IOException("Invalid response");out.write(b,0,n);}return new JSONObject(out.toString("UTF-8"));}
+        }finally{conn.disconnect();}
+    }
+    private static final long MEDIA_BASE=4000000000000000000L,AVATAR_BASE=2000000000000000000L;
+    private static long localId(String id,long base)throws IOException{
+        if(!id.matches("[a-f0-9]{32}"))throw new IOException("Invalid asset ID");
+        return base+Long.parseLong(id.substring(0,15),16);
+    }
+    private static File avatarFile(int a,long id){
+        return new File(new File(ApplicationLoader.applicationContext.getCacheDir(),"toxicgram_avatars_"+a),id+".jpg");
+    }
+    public static String avatarPath(int a,long id){
+        if(id<AVATAR_BASE||id>=AVATAR_BASE+(1L<<60))return null;
+        File f=avatarFile(a,id);return f.isFile()?f.getAbsolutePath():null;
+    }
+    private static void fetchAsset(int a,String id,File target,int max)throws Exception{
+        if(!id.matches("[a-f0-9]{32}"))throw new IOException("Invalid asset");
+        if(target.isFile()&&target.length()>0)return;
+        File parent=target.getParentFile();if(parent!=null&&!parent.isDirectory()&&!parent.mkdirs())throw new IOException("Cache unavailable");
+        File tmp=File.createTempFile("tg-asset-",".tmp",parent);
+        HttpsURLConnection conn=(HttpsURLConnection)new URL(BASE+"/v1/media/"+id).openConnection();
+        try{
+            conn.setConnectTimeout(10000);conn.setReadTimeout(20000);conn.setInstanceFollowRedirects(false);conn.setRequestProperty("Authorization","Bearer "+token(a));
+            if(conn.getResponseCode()!=200)throw new IOException("Asset unavailable");
+            try(InputStream in=conn.getInputStream();OutputStream out=new FileOutputStream(tmp)){byte[] b=new byte[16384];int n,total=0;while((n=in.read(b))!=-1){total+=n;if(total>max)throw new IOException("Asset too large");out.write(b,0,n);}}
+            if(!tmp.renameTo(target)&&!target.isFile())throw new IOException("Cache write failed");
+        }finally{conn.disconnect();tmp.delete();}
+    }
+    private static TLRPC.FileLocation avatarLocation(long id,int type){
+        TLRPC.TL_fileLocationToBeDeprecated loc=new TLRPC.TL_fileLocationToBeDeprecated();loc.volume_id=-id;loc.local_id=type;loc.dc_id=1;return loc;
+    }
+    private static TLRPC.TL_photo avatarPhoto(int a,String asset)throws Exception{
+        long id=localId(asset,AVATAR_BASE);File file=avatarFile(a,id);fetchAsset(a,asset,file,512*1024);
+        TLRPC.TL_photo photo=new TLRPC.TL_photo();photo.id=id;photo.access_hash=id;photo.file_reference=asset.getBytes(StandardCharsets.UTF_8);photo.dc_id=1;photo.date=(int)(System.currentTimeMillis()/1000L);
+        for(String type:new String[]{"a","c"}){
+            TLRPC.TL_photoSize size=new TLRPC.TL_photoSize();size.type=type;size.w="a".equals(type)?150:800;size.h=size.w;size.size=(int)file.length();size.location=avatarLocation(id,type.charAt(0));photo.sizes.add(size);
+        }
+        return photo;
+    }
+    private static TLRPC.TL_user user(int a,JSONObject p,boolean self)throws Exception{
         TLRPC.TL_user u=new TLRPC.TL_user();
         u.id=userId(p.getString("number"));u.first_name=p.optString("first_name",p.optString("name",p.optString("phone","Toxicgram")));u.last_name=p.optString("last_name","");
         u.phone=p.optString("phone","").replace("+","");u.username=p.optString("username","");
         u.self=self;u.flags=2|4|16|(u.username.isEmpty()?0:8)|(self?1024:0);
         u.access_hash=u.id;u.flags|=1;
         if(p.has("last_seen")){u.status=presence(p);u.flags|=64;}
+        String asset=p.optString("avatar","");
+        if(asset.matches("[a-f0-9]{32}")){
+            long id=localId(asset,AVATAR_BASE);
+            TLRPC.TL_userProfilePhoto photo=new TLRPC.TL_userProfilePhoto();photo.photo_id=id;photo.dc_id=1;photo.photo_small=avatarLocation(id,'a');photo.photo_big=avatarLocation(id,'c');
+            u.photo=photo;u.flags|=32;
+            try{fetchAsset(a,asset,avatarFile(a,id),512*1024);}catch(Exception ignored){}
+        }else if(p.has("avatar")){u.photo=new TLRPC.TL_userProfilePhotoEmpty();u.flags|=32;}
         return u;
     }
     private static String canonical(long id) throws ApiError {
@@ -221,7 +295,7 @@ public final class ToxicgramRpc {
     private static TLRPC.TL_peerUser peerObject(String number){
         TLRPC.TL_peerUser p=new TLRPC.TL_peerUser();p.user_id=userId(number);return p;
     }
-    private static TLRPC.TL_message message(JSONObject data,String self)throws Exception{
+    private static TLRPC.TL_message message(int a,JSONObject data,String self)throws Exception{
         TLRPC.TL_message m=new TLRPC.TL_message();
         m.id=Math.toIntExact(data.getLong("id"));m.date=data.getInt("created");
         m.message=data.optString("text","");m.out=self.equals(data.optString("sender"));
@@ -229,6 +303,8 @@ public final class ToxicgramRpc {
         m.peer_id=peerObject(other);m.from_id=peerObject(data.getString("sender"));
         m.flags=256|(m.out?2:0);m.media=new TLRPC.TL_messageMediaEmpty();
         if(data.optLong("edited")>0){m.edit_date=data.getInt("edited");m.flags|=32768;}
+        JSONObject attachment=data.optJSONObject("attachment");
+        if(attachment!=null){m.media=documentMedia(a,attachment,m.date,null);m.flags|=512;}
         return m;
     }
     public static void send(int account,TLObject request,RequestDelegate completion,RequestDelegateTimestamp timestamp){
@@ -382,10 +458,11 @@ public final class ToxicgramRpc {
             JSONArray catalog=http("GET","/v1/gifts?dynamic=true",null,t).getJSONArray("catalog");
             for(int i=0;i<received.length();i++){
                 JSONObject row=received.getJSONObject(i);boolean visible=row.optInt("visible")!=0;
-                if((query.exclude_unsaved&&!visible)||(query.exclude_saved&&visible)||query.exclude_unlimited||query.exclude_unupgradable)continue;
-                TL_stars.TL_savedStarGift g=new TL_stars.TL_savedStarGift();g.gift=gift(findGift(catalog,row.getString("kind")));g.date=row.getInt("created");
+                JSONObject item=findGift(catalog,row.getString("kind"));
+                if((query.exclude_unsaved&&!visible)||(query.exclude_saved&&visible)||(query.exclude_unlimited&&item.optInt("supply")==0)||query.exclude_unupgradable)continue;
+                TL_stars.TL_savedStarGift g=new TL_stars.TL_savedStarGift();try{g.gift=gift(item);}catch(Exception ignored){continue;}g.date=row.getInt("created");
                 g.msg_id=Math.toIntExact(row.getLong("id"));g.flags=8;g.unsaved=!visible;g.name_hidden=row.optInt("anonymous")!=0;
-                String sender=row.optString("sender");if(!sender.isEmpty()){g.from_id=peerObject(sender);g.flags|=2;}
+                String sender=row.optString("sender");if(sender.matches("TG-[0-9]{4}-[0-9]{4}")){g.from_id=peerObject(sender);g.flags|=2;try{result.users.add(user(a,http("GET","/v1/users/"+sender,null,t),sender.equals(prefs(a).getString("number",""))));}catch(Exception ignored){}}
                 String message=row.optString("message");if(!message.isEmpty()){g.message=new TLRPC.TL_textWithEntities();g.message.text=message;g.flags|=4;}
                 result.gifts.add(g);
             }
@@ -407,13 +484,69 @@ public final class ToxicgramRpc {
     private static TLRPC.TL_updates updates(){
         TLRPC.TL_updates u=new TLRPC.TL_updates();u.date=(int)(System.currentTimeMillis()/1000L);return u;
     }
+    private static TLRPC.TL_messageMediaDocument documentMedia(int a,JSONObject row,int date,File original)throws Exception{
+        String asset=row.getString("id"),kind=row.optString("kind","file");
+        TLRPC.TL_document d=new TLRPC.TL_document();d.id=localId(asset,MEDIA_BASE);d.access_hash=d.id;d.file_reference=asset.getBytes(StandardCharsets.UTF_8);d.date=date;d.dc_id=1;d.size=row.optLong("size");d.mime_type=row.optString("mime","application/octet-stream");
+        TLRPC.TL_documentAttributeFilename fn=new TLRPC.TL_documentAttributeFilename();fn.file_name=row.optString("name","file");d.attributes.add(fn);
+        if("voice".equals(kind)){TLRPC.TL_documentAttributeAudio audio=new TLRPC.TL_documentAttributeAudio();audio.voice=true;audio.duration=row.optInt("duration");audio.flags=1024;d.attributes.add(audio);}
+        if("round".equals(kind)){TLRPC.TL_documentAttributeVideo video=new TLRPC.TL_documentAttributeVideo();video.round_message=true;video.duration=row.optInt("duration");video.w=row.optInt("width",360);video.h=row.optInt("height",360);video.flags=1;d.attributes.add(video);}
+        TLRPC.TL_messageMediaDocument m=new TLRPC.TL_messageMediaDocument();m.document=d;m.flags=1;m.voice="voice".equals(kind);m.round="round".equals(kind);m.video=m.round;
+        if(m.voice)m.flags|=256;if(m.round)m.flags|=128|64;
+        File target=FileLoader.getInstance(a).getPathToAttach(d,false);
+        try{
+            if(original!=null&&!target.isFile()){File parent=target.getParentFile();if(parent!=null)parent.mkdirs();try(InputStream in=new FileInputStream(original);OutputStream out=new FileOutputStream(target)){byte[] b=new byte[32768];int n;while((n=in.read(b))!=-1)out.write(b,0,n);}}
+            else if(original==null)fetchAsset(a,asset,target,8*1024*1024);
+        }catch(Exception ignored){}
+        return m;
+    }
+    private static TLObject mediaRpc(int a,TLObject req)throws Exception{
+        if(req instanceof TLRPC.TL_photos_uploadProfilePhoto){
+            TLRPC.TL_photos_uploadProfilePhoto q=(TLRPC.TL_photos_uploadProfilePhoto)req;
+            if(q.video!=null||q.bot!=null||q.fallback)throw new ApiError(400,"TOXICGRAM_PHOTO_ONLY");
+            File source=stagedFile(a,q.file);
+            android.graphics.BitmapFactory.Options opt=new android.graphics.BitmapFactory.Options();opt.inJustDecodeBounds=true;android.graphics.BitmapFactory.decodeFile(source.getAbsolutePath(),opt);
+            if(opt.outWidth<=0||opt.outHeight<=0)throw new ApiError(400,"PHOTO_INVALID");
+            opt.inJustDecodeBounds=false;opt.inSampleSize=1;while(Math.max(opt.outWidth,opt.outHeight)/opt.inSampleSize>1600)opt.inSampleSize*=2;
+            android.graphics.Bitmap bm=android.graphics.BitmapFactory.decodeFile(source.getAbsolutePath(),opt);
+            if(bm==null)throw new ApiError(400,"PHOTO_INVALID");
+            File tmp=File.createTempFile("tg-avatar-",".jpg",ApplicationLoader.applicationContext.getCacheDir());
+            try{
+                try(OutputStream out=new FileOutputStream(tmp)){bm.compress(android.graphics.Bitmap.CompressFormat.JPEG,85,out);}
+                String id=uploadBytes(a,"PUT","/v1/avatar",tmp,512*1024).getString("avatar");
+                JSONObject p=http("GET","/v1/me",null,token(a));
+                TLRPC.TL_photos_photo result=new TLRPC.TL_photos_photo();result.photo=avatarPhoto(a,id);result.users.add(user(a,p,true));return result;
+            }finally{bm.recycle();tmp.delete();}
+        }
+        if(req instanceof TLRPC.TL_photos_getUserPhotos){
+            TLRPC.TL_photos_getUserPhotos q=(TLRPC.TL_photos_getUserPhotos)req;String n=inputUser(a,q.user_id);boolean self=n.equals(prefs(a).getString("number",""));
+            JSONObject p=http("GET",self?"/v1/me":"/v1/users/"+n,null,token(a));TLRPC.TL_photos_photos result=new TLRPC.TL_photos_photos();
+            String id=p.optString("avatar","");if(q.offset==0&&q.max_id==0&&id.matches("[a-f0-9]{32}"))result.photos.add(avatarPhoto(a,id));
+            result.users.add(user(a,p,self));return result;
+        }
+        if(req instanceof TLRPC.TL_messages_sendMedia){
+            TLRPC.TL_messages_sendMedia q=(TLRPC.TL_messages_sendMedia)req;
+            if(!(q.media instanceof TLRPC.TL_inputMediaUploadedDocument)||isRoom(q.peer)||q.schedule_date!=0)throw new ApiError(501,"TOXICGRAM_MEDIA_NOT_IMPLEMENTED");
+            File source=stagedFile(a,q.media.file);String kind="",mime=q.media.mime_type,name=source.getName();int duration=0,w=0,h=0;
+            for(TLRPC.DocumentAttribute attr:q.media.attributes){
+                if(attr instanceof TLRPC.TL_documentAttributeAudio&&attr.voice){kind="voice";duration=(int)Math.ceil(attr.duration);}
+                if(attr instanceof TLRPC.TL_documentAttributeVideo&&attr.round_message){kind="round";duration=(int)Math.ceil(attr.duration);w=attr.w;h=attr.h;}
+            }
+            if(kind.isEmpty())throw new ApiError(501,"TOXICGRAM_MEDIA_NOT_IMPLEMENTED");
+            if("voice".equals(kind)){mime="audio/ogg";name="voice.ogg";}else{mime="video/mp4";name="video.mp4";}
+            String path="/v1/attachments?recipient="+android.net.Uri.encode(peer(a,q.peer))+"&kind="+kind+"&mime="+android.net.Uri.encode(mime)+"&name="+name+"&duration="+duration+"&width="+w+"&height="+h+"&request_id="+q.random_id+"&caption="+android.net.Uri.encode(q.message==null?"":q.message);
+            JSONObject sent=uploadBytes(a,"POST",path,source,8*1024*1024);
+            JSONObject row=new JSONObject().put("id",sent.getString("attachment")).put("kind",kind).put("name",name).put("mime",mime).put("duration",duration).put("width",w).put("height",h).put("size",source.length());
+            TLRPC.TL_updateShortSentMessage result=new TLRPC.TL_updateShortSentMessage();result.id=sent.getInt("id");result.date=sent.getInt("created");result.out=true;result.flags=2|512;result.media=documentMedia(a,row,result.date,source);return result;
+        }
+        return null;
+    }
     private static TLObject profileRpc(int a,TLObject req)throws Exception{
         if(req instanceof TL_account.updateProfile){
             TL_account.updateProfile q=(TL_account.updateProfile)req;JSONObject body=new JSONObject();
             if((q.flags&1)!=0)body.put("first_name",q.first_name);
             if((q.flags&2)!=0)body.put("last_name",q.last_name);
             if((q.flags&4)!=0)body.put("bio",q.about);
-            return user(http("PUT","/v1/profile/partial",body,token(a)),true);
+            return user(a,http("PUT","/v1/profile/partial",body,token(a)),true);
         }
         if(req instanceof TL_account.checkUsername){
             String username=((TL_account.checkUsername)req).username;
@@ -422,7 +555,7 @@ public final class ToxicgramRpc {
             return new TLRPC.TL_boolTrue();
         }
         if(req instanceof TL_account.updateUsername){
-            try{return user(http("PUT","/v1/profile/partial",new JSONObject().put("username",((TL_account.updateUsername)req).username),token(a)),true);}
+            try{return user(a,http("PUT","/v1/profile/partial",new JSONObject().put("username",((TL_account.updateUsername)req).username),token(a)),true);}
             catch(ApiError e){if(e.code==409)throw new ApiError(400,"USERNAME_OCCUPIED");if(e.code==400)throw new ApiError(400,"USERNAME_INVALID");throw e;}
         }
         if(req instanceof TLRPC.TL_users_getFullUser){
@@ -432,14 +565,15 @@ public final class ToxicgramRpc {
             TLRPC.TL_users_userFull result=new TLRPC.TL_users_userFull();
             TLRPC.TL_userFull full=new TLRPC.TL_userFull();full.id=userId(number);full.about=p.optString("bio","");full.flags=2;
             full.settings=new TLRPC.TL_peerSettings();full.notify_settings=new TLRPC.TL_peerNotifySettings();
-            full.stargifts_count=p.optInt("gift_count",0);
-            result.full_user=full;result.users.add(user(p,self));return result;
+            full.stargifts_count=p.optInt("gift_count",0);full.flags2|=256;
+            String avatar=p.optString("avatar","");if(avatar.matches("[a-f0-9]{32}")){try{full.profile_photo=avatarPhoto(a,avatar);full.flags|=4;}catch(Exception ignored){}}
+            result.full_user=full;result.users.add(user(a,p,self));return result;
         }
         if(req instanceof TLRPC.TL_contacts_search){
             String q=((TLRPC.TL_contacts_search)req).q;
             JSONArray users=http("GET","/v1/users-search?q="+android.net.Uri.encode(q),null,token(a)).getJSONArray("users");
             TLRPC.TL_contacts_found result=new TLRPC.TL_contacts_found();
-            for(int i=0;i<users.length();i++){JSONObject p=users.getJSONObject(i);result.users.add(user(p,false));result.results.add(peerObject(p.getString("number")));}
+            for(int i=0;i<users.length();i++){JSONObject p=users.getJSONObject(i);result.users.add(user(a,p,false));result.results.add(peerObject(p.getString("number")));}
             return result;
         }
         return null;
@@ -494,7 +628,7 @@ public final class ToxicgramRpc {
                 }
                 full.participants=ps;
             }
-            for(int i=0;i<members.length();i++){JSONObject p=members.getJSONObject(i);result.users.add(user(p,self.equals(p.getString("number"))));}
+            for(int i=0;i<members.length();i++){JSONObject p=members.getJSONObject(i);result.users.add(user(a,p,self.equals(p.getString("number"))));}
             result.full_chat=full;result.chats.add(roomChat(row,self));return result;
         }
         if(req instanceof TLRPC.TL_messages_createChat){
@@ -521,7 +655,7 @@ public final class ToxicgramRpc {
             JSONArray messages=http("GET",path,null,t).getJSONArray("messages"),members=info.getJSONArray("users");
             TLRPC.TL_messages_messages result=new TLRPC.TL_messages_messages();
             for(int i=messages.length()-1;i>=0;i--)result.messages.add(roomMessage(messages.getJSONObject(i),room,self));
-            for(int i=0;i<members.length();i++){JSONObject p=members.getJSONObject(i);result.users.add(user(p,self.equals(p.getString("number"))));}
+            for(int i=0;i<members.length();i++){JSONObject p=members.getJSONObject(i);result.users.add(user(a,p,self.equals(p.getString("number"))));}
             result.chats.add(roomChat(room,self));return result;
         }
         if(req instanceof TLRPC.TL_messages_sendMessage && isRoom(((TLRPC.TL_messages_sendMessage)req).peer)){
@@ -533,6 +667,8 @@ public final class ToxicgramRpc {
         return null;
     }
     private static TLObject dispatch(int a,TLObject req)throws Exception{
+        TLObject mediaResponse=mediaRpc(a,req);
+        if(mediaResponse!=null)return mediaResponse;
         TLObject profileResponse=profileRpc(a,req);
         if(profileResponse!=null)return profileResponse;
         TLObject roomResponse=roomsRpc(a,req);
@@ -557,7 +693,7 @@ public final class ToxicgramRpc {
             String t=login.getString("access_token");
             JSONObject profile=http("GET","/v1/me",null,t);
             TLRPC.TL_auth_authorization auth=new TLRPC.TL_auth_authorization();
-            auth.user=user(profile,true);
+            auth.user=user(a,profile,true);
             setForeground(a,false);store(a,t,profile.getString("number"));setForeground(a,true);ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);return auth;
         }
         if(req instanceof TLRPC.TL_auth_logOut){
@@ -573,7 +709,7 @@ public final class ToxicgramRpc {
             for(int i=0;i<chats.length();i++){
                 JSONObject row=chats.getJSONObject(i);String number=row.getString("number");
                 boolean isSelf=self.equals(number);
-                TLRPC.TL_user u=user(row,isSelf);result.users.add(u);
+                TLRPC.TL_user u=user(a,row,isSelf);result.users.add(u);
                 TLRPC.TL_dialog dialog=new TLRPC.TL_dialog();
                 dialog.peer=peerObject(number);dialog.top_message=Math.toIntExact(row.getLong("id"));
                 dialog.unread_count=row.optInt("unread");dialog.notify_settings=new TLRPC.TL_peerNotifySettings();
@@ -581,7 +717,7 @@ public final class ToxicgramRpc {
                 result.dialogs.add(dialog);
                 // Fetch actual latest message rather than infer its sender from the dialog.
                 JSONArray history=http("GET","/v1/chats/"+number+"/messages",null,t).getJSONArray("messages");
-                if(history.length()>0)result.messages.add(message(history.getJSONObject(history.length()-1),self));
+                if(history.length()>0)result.messages.add(message(a,history.getJSONObject(history.length()-1),self));
             }
             JSONArray rooms=http("GET","/v1/rooms",null,t).getJSONArray("rooms");
             for(int i=0;i<rooms.length();i++){
@@ -591,7 +727,7 @@ public final class ToxicgramRpc {
                 if(history.length()>0){
                     JSONObject latest=history.getJSONObject(history.length()-1);TLRPC.TL_message m=roomMessage(latest,row,self);dialog.top_message=m.id;result.messages.add(m);
                     String sender=latest.getString("sender");
-                    if(!self.equals(sender))result.users.add(user(http("GET","/v1/users/"+sender,null,t),false));
+                    if(!self.equals(sender))result.users.add(user(a,http("GET","/v1/users/"+sender,null,t),false));
                 }
                 result.dialogs.add(dialog);
             }
@@ -603,8 +739,8 @@ public final class ToxicgramRpc {
             String path="/v1/chats/"+other+"/messages"+(query.offset_id>0?"?before="+query.offset_id:"");
             JSONArray messages=http("GET",path,null,t).getJSONArray("messages");
             TLRPC.TL_messages_messages result=new TLRPC.TL_messages_messages();
-            for(int i=messages.length()-1;i>=0;i--)result.messages.add(message(messages.getJSONObject(i),self));
-            if(!other.equals(self))result.users.add(user(http("GET","/v1/users/"+other,null,t),false));
+            for(int i=messages.length()-1;i>=0;i--)result.messages.add(message(a,messages.getJSONObject(i),self));
+            if(!other.equals(self))result.users.add(user(a,http("GET","/v1/users/"+other,null,t),false));
             return result;
         }
         if(req instanceof TLRPC.TL_messages_sendMessage){
@@ -624,7 +760,7 @@ public final class ToxicgramRpc {
             String value=req instanceof TLRPC.TL_contacts_resolveUsername?"@"+((TLRPC.TL_contacts_resolveUsername)req).username:phone(((TLRPC.TL_contacts_resolvePhone)req).phone);
             JSONObject profile=http("GET","/v1/users/"+android.net.Uri.encode(value),null,token(a));
             TLRPC.TL_contacts_resolvedPeer result=new TLRPC.TL_contacts_resolvedPeer();
-            result.peer=peerObject(profile.getString("number"));result.users.add(user(profile,prefs(a).getString("number","").equals(profile.getString("number"))));return result;
+            result.peer=peerObject(profile.getString("number"));result.users.add(user(a,profile,prefs(a).getString("number","").equals(profile.getString("number"))));return result;
         }
         // All unported methods fail closed. No native MTProto or official Telegram RPC fallback.
         throw new ApiError(501,"TOXICGRAM_METHOD_NOT_IMPLEMENTED");
