@@ -292,5 +292,38 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(client.get("/v1/rooms/by-id/"+str(numeric),headers=hb).json()["room"]["id"],room["id"])
 
 
+    def test_incoming_sync_and_presence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server.DB=str(Path(temp)/"test.sqlite3")
+            server.PEPPER="test-only-key-not-for-deployment-0000000"
+            server.TOKEN=""
+            with TestClient(server.app) as client:
+                def login(tid):
+                    n,code=server.issue(tid)
+                    r=client.post("/v1/auth/verify",json={"number":n,"code":code})
+                    return n,{"Authorization":"Bearer "+r.json()["access_token"]}
+                a,ha=login(181);b,hb=login(182);c,hc=login(183)
+                self.assertEqual(client.get("/v1/sync").status_code,401)
+                self.assertEqual(client.get("/v1/sync",headers=hb).json()["messages"],[])
+                first=client.post("/v1/messages",headers=ha,json={"recipient":b,"text":"hello"}).json()["id"]
+                initial=client.get("/v1/sync",headers=hb).json()
+                self.assertEqual([m["id"] for m in initial["messages"]],[first])
+                self.assertEqual(initial["users"][0]["number"],a)
+                self.assertEqual(client.get("/v1/sync",headers=hc).json()["messages"],[])
+                self.assertEqual(client.get("/v1/sync",headers=hc).json()["statuses"],[])
+                self.assertGreater(client.get("/v1/users/"+b,headers=ha).json()["online_until"],initial["server_time"])
+                self.assertEqual(client.get("/v1/users/"+b,headers=hc).json()["last_seen"],0)
+                self.assertEqual(client.put("/v1/chats/"+a+"/read",headers=hb,json={"last_id":first}).status_code,200)
+                receipt=client.get("/v1/sync",headers=ha).json()
+                self.assertEqual(receipt["statuses"][0]["read_outbox"],first)
+                self.assertEqual(client.get("/v1/sync",headers=hb).json()["messages"],[])
+                second=client.post("/v1/messages",headers=ha,json={"recipient":b,"text":"second"}).json()["id"]
+                update=client.get("/v1/sync?after="+str(initial["cursor"]),headers=hb).json()
+                self.assertEqual([m["id"] for m in update["messages"]],[second])
+                self.assertEqual(client.get("/v1/sync?after="+str(update["cursor"]),headers=hb).json()["messages"],[])
+                self.assertEqual(client.put("/v1/users/"+a+"/block",headers=hb,json={"blocked":True}).status_code,200)
+                self.assertEqual(client.get("/v1/users/"+b,headers=ha).json()["last_seen"],0)
+
+
 if __name__=="__main__":
     unittest.main()
