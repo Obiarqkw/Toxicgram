@@ -426,7 +426,7 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(sync["messages"][0]["attachment"]["kind"],"voice")
                 self.assertEqual(sync["messages"][0]["attachment"]["duration"],3)
                 self.assertEqual(client.post("/v1/attachments",headers=ha,params={**params,"request_id":"124"},content=b"invalid").status_code,400)
-                video=b"\\x00\\x00\\x00\\x18ftypmp42"+bytes(80)
+                video=bytes([0,0,0,24])+b"ftypmp42"+bytes(80)
                 v=client.post("/v1/attachments",headers=ha,params={"recipient":b,"name":"video.mp4","mime":"video/mp4","kind":"round","duration":5,"width":360,"height":360,"request_id":"125"},content=video)
                 self.assertEqual(v.status_code,200)
                 msgs=client.get("/v1/chats/"+a+"/messages",headers=hb).json()["messages"]
