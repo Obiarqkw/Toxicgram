@@ -28,6 +28,10 @@ def init():
         c.executescript("""
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS accounts (telegram_id INTEGER PRIMARY KEY, number TEXT UNIQUE NOT NULL, code_hash TEXT, expires INTEGER DEFAULT 0, issued INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS referral_codes (number TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS referrals (invitee TEXT PRIMARY KEY, inviter TEXT NOT NULL, created INTEGER NOT NULL, rewarded_at INTEGER NOT NULL DEFAULT 0, reward INTEGER NOT NULL DEFAULT 0, CHECK(invitee<>inviter));
+        CREATE INDEX IF NOT EXISTS referrals_inviter ON referrals(inviter,rewarded_at);
+        CREATE TABLE IF NOT EXISTS registrations (number TEXT PRIMARY KEY, registered_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, number TEXT NOT NULL, expires INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS limits (key TEXT PRIMARY KEY, window INTEGER, count INTEGER);
         CREATE TABLE IF NOT EXISTS profiles (number TEXT PRIMARY KEY, name TEXT NOT NULL);
@@ -105,7 +109,27 @@ def public_profile(n):
 def digest(s):
     return hmac.new(PEPPER.encode(), s.encode(), hashlib.sha256).hexdigest()
 
-def issue(tid):
+REFERRAL_REWARD=500
+
+def referral_stats(tid):
+    """Only the owning Telegram bot user may obtain their referral code."""
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT a.number FROM accounts a WHERE a.telegram_id=? AND NOT EXISTS(SELECT 1 FROM account_freezes f WHERE f.number=a.number)",(tid,)).fetchone()
+        if not row:return None
+        n=row["number"]
+        code=c.execute("SELECT code FROM referral_codes WHERE number=?",(n,)).fetchone()
+        if not code:
+            while True:
+                value=secrets.token_urlsafe(18)
+                if c.execute("INSERT OR IGNORE INTO referral_codes(number,code) VALUES (?,?)",(n,value)).rowcount:break
+            code={"code":value}
+        stats=c.execute("SELECT COUNT(*) AS total,COALESCE(SUM(CASE WHEN rewarded_at>0 THEN 1 ELSE 0 END),0) AS completed,COALESCE(SUM(reward),0) AS earned FROM referrals WHERE inviter=?",(n,)).fetchone()
+        wallet=c.execute("SELECT balance FROM wallets WHERE number=?",(n,)).fetchone()
+        c.commit()
+    return {"code":code["code"],"total":stats["total"],"completed":stats["completed"],"pending":stats["total"]-stats["completed"],"earned":stats["earned"],"balance":wallet["balance"] if wallet else 1000}
+
+def issue(tid,referral_code=None):
     now = int(time.time())
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -125,6 +149,12 @@ def issue(tid):
                 if not c.execute("SELECT 1 FROM accounts WHERE number=?", (n,)).fetchone():
                     break
             c.execute("INSERT INTO accounts(telegram_id,number) VALUES (?,?)", (tid,n))
+            # Only the first bot start can bind an invitation. Existing accounts
+            # cannot be attributed retroactively, even after a number change.
+            if isinstance(referral_code,str) and re.fullmatch(r"[A-Za-z0-9_-]{24}",referral_code):
+                inviter=c.execute("SELECT r.number FROM referral_codes r JOIN accounts a ON a.number=r.number WHERE r.code=? AND a.telegram_id<>? AND NOT EXISTS(SELECT 1 FROM account_freezes f WHERE f.number=r.number)",(referral_code,tid)).fetchone()
+                if inviter and inviter["number"]!=n:
+                    c.execute("INSERT INTO referrals(invitee,inviter,created) VALUES (?,?,?)",(n,inviter["number"],now))
         code = f"{secrets.randbelow(1000000):06d}"
         c.execute("UPDATE accounts SET code_hash=?,expires=?,issued=?,attempts=0 WHERE telegram_id=?", (digest(n+":"+code),now+300,now,tid))
         c.commit()
@@ -146,6 +176,19 @@ def consume(n,code):
         c.execute("UPDATE accounts SET code_hash=NULL,expires=0 WHERE number=?", (n,))
         c.execute("DELETE FROM sessions WHERE expires<=?", (now,))
         c.execute("INSERT INTO sessions VALUES (?,?,?)", (digest(token),n,now+TTL))
+        first=c.execute("INSERT OR IGNORE INTO registrations VALUES (?,?)",(n,now)).rowcount
+        if first:
+            ref=c.execute("SELECT inviter FROM referrals WHERE invitee=? AND rewarded_at=0",(n,)).fetchone()
+            if ref:
+                inviter=ref["inviter"]
+                # The successful code verification, ledger entry and wallet credit
+                # are one transaction. A repeated login cannot pay again.
+                paid=c.execute("UPDATE referrals SET rewarded_at=?,reward=? WHERE invitee=? AND rewarded_at=0",(now,REFERRAL_REWARD,n)).rowcount
+                if paid:
+                    c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(inviter,))
+                    before=c.execute("SELECT balance FROM wallets WHERE number=?",(inviter,)).fetchone()[0]
+                    c.execute("UPDATE wallets SET balance=balance+? WHERE number=?",(REFERRAL_REWARD,inviter))
+                    c.execute("INSERT INTO admin_user_actions(number,action,detail,reason,created) VALUES (?,?,?,?,?)",(inviter,"referral.reward",json.dumps({"delta":REFERRAL_REWARD,"before":before,"balance":before+REFERRAL_REWARD}),"Первый успешный вход приглашённого",now))
         c.commit()
         return token
 
@@ -166,6 +209,7 @@ def api(method,payload):
 
 def poll(stop):
     offset=0
+    bot_username=None
     while not stop.is_set():
         try:
             for u in api("getUpdates",{"offset":offset,"timeout":25,"allowed_updates":["message"]}):
@@ -176,24 +220,47 @@ def poll(stop):
                 if chat.get("type")!="private" or not sender.get("id"):
                     continue
                 cmd=m.get("text","").strip().split(maxsplit=1)
-                if cmd and cmd[0].split("@")[0] in ("/start","/code","/number"):
+                command=cmd[0].split("@")[0].lower() if cmd else ""
+                if command in ("/ref","/referral","/referrals","/invite"):
+                    if not allow("referral_bot:"+str(sender["id"])):
+                        continue
+                    stats=referral_stats(sender["id"])
+                    if not stats:
+                        reply="Сначала создайте аккаунт Toxicgram через /start. Если аккаунт заморожен, обратитесь к администратору."
+                    else:
+                        if not bot_username:bot_username=api("getMe",{})["username"]
+                        link=f"https://t.me/{bot_username}?start=ref_{stats['code']}"
+                        reply=(f"🎁 Приглашай друзей в Toxicgram!\n\n"
+                               f"За каждого нового пользователя, который впервые успешно войдёт в приложение, вы получите 500 Toxic Stars.\n\n"
+                               f"Ваша ссылка:\n{link}\n\n"
+                               f"Приглашений: {stats['total']}\n"
+                               f"Ожидают регистрации: {stats['pending']}\n"
+                               f"Зарегистрировались: {stats['completed']}\n"
+                               f"Заработано: {stats['earned']} ⭐\n"
+                               f"Баланс: {stats['balance']} ⭐\n\n"
+                               f"Друг должен впервые открыть бота по вашей ссылке, получить код и войти в Toxicgram. Повторные входы не учитываются.")
+                    # This message contains no login codes and may be forwarded.
+                    api("sendMessage",{"chat_id":chat["id"],"text":reply})
+                    continue
+                if command in ("/start","/code","/number"):
                     prefix=None
                     if cmd[0].split("@")[0]=="/number":
                         if len(cmd)!=2 or cmd[1] not in ("+7","+1","+388"):
                             api("sendMessage",{"chat_id":chat["id"],"text":"Выберите виртуальный префикс: /number +7, /number +1 или /number +388. Это внутренние номера, не SIM-карты."})
                             continue
                         prefix=cmd[1]
-                    result=issue(sender["id"])
+                    ref_code=cmd[1][4:] if command=="/start" and len(cmd)==2 and cmd[1].startswith("ref_") else None
+                    result=issue(sender["id"],ref_code)
                     if result:
                         n,code=result
                         phone=phone_for(n,prefix)
-                        reply=f"Toxicgram\nВаш виртуальный номер: {phone}\nКод Toxicgram: {code}\nДействует 5 минут. Не пересылайте код.\nТолько для Toxicgram, не настоящий телефон.\nПрефикс: /number +7, /number +1, /number +388.\nСтарый ID: {n}"
+                        reply=f"Toxicgram\nВаш виртуальный номер: {phone}\nКод Toxicgram: {code}\nДействует 5 минут. Не пересылайте код.\nТолько для Toxicgram, не настоящий телефон.\nПрефикс: /number +7, /number +1, /number +388.\nСтарый ID: {n}\n\nПриглашай друзей: /ref — 500 Toxic Stars за первую регистрацию."
                     else:
                         with db() as conn:
                             frozen=conn.execute("SELECT 1 FROM account_freezes f JOIN accounts a ON a.number=f.number WHERE a.telegram_id=?",(sender["id"],)).fetchone()
                         reply="Ваш аккаунт Toxicgram заморожен. Обратитесь к администратору." if frozen else "Подождите 30 секунд перед запросом нового кода."
                 else:
-                    reply="Используйте /code для получения кода Toxicgram."
+                    reply="Используйте /code для получения кода Toxicgram. /ref — ваша реферальная ссылка и статистика."
                 api("sendMessage",{"chat_id":chat["id"],"text":reply,"protect_content":True})
         except Exception:
             print("Bot polling failed; retrying.",flush=True)
