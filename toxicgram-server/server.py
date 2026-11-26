@@ -40,6 +40,8 @@ def init():
         CREATE TABLE IF NOT EXISTS message_edits (message_id INTEGER PRIMARY KEY, edited INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS phone_aliases (number TEXT PRIMARY KEY, phone TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS used_phones (phone TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS profile_names (number TEXT PRIMARY KEY, first_name TEXT NOT NULL, last_name TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS room_meta (numeric_id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT UNIQUE NOT NULL, about TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL DEFAULT 'basic', created INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS profile_details (number TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE, bio TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS reactions (message_id INTEGER NOT NULL, owner TEXT NOT NULL, emoji TEXT NOT NULL, PRIMARY KEY(message_id,owner));
         CREATE TABLE IF NOT EXISTS blocks (owner TEXT NOT NULL, peer TEXT NOT NULL, PRIMARY KEY(owner,peer));
@@ -65,6 +67,7 @@ def init():
         CREATE TABLE IF NOT EXISTS stories (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, text TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS story_owner ON stories(owner,created);
         """)
+        c.execute("INSERT OR IGNORE INTO room_meta(room_id,mode) SELECT id,CASE WHEN kind='channel' THEN 'channel' ELSE 'basic' END FROM rooms ORDER BY rowid")
         seed_catalog(c)
 
 def phone_for(n, prefix=None):
@@ -93,7 +96,9 @@ def public_profile(n):
         row=c.execute("SELECT name FROM profiles WHERE number=?",(n,)).fetchone()
         details=c.execute("SELECT username,bio FROM profile_details WHERE number=?",(n,)).fetchone()
         avatar=c.execute("SELECT media_id FROM avatars WHERE number=?",(n,)).fetchone()
-    return {"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
+        names=c.execute("SELECT first_name,last_name FROM profile_names WHERE number=?",(n,)).fetchone()
+        gift_count=c.execute("SELECT COUNT(*) FROM gifts g LEFT JOIN gift_details d ON g.id=d.gift_id WHERE g.recipient=? AND d.visible=1",(n,)).fetchone()[0]
+    return {"first_name":names["first_name"] if names else (row["name"] if row else phone),"last_name":names["last_name"] if names else "","gift_count":gift_count,"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
 
 def digest(s):
     return hmac.new(PEPPER.encode(), s.encode(), hashlib.sha256).hexdigest()
@@ -292,6 +297,7 @@ def update_profile(body:ProfileUpdate,request:Request):
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         c.execute("INSERT INTO profiles VALUES (?,?) ON CONFLICT(number) DO UPDATE SET name=excluded.name",(n,name))
+        c.execute("INSERT INTO profile_names VALUES (?,?,?) ON CONFLICT(number) DO UPDATE SET first_name=excluded.first_name,last_name=excluded.last_name",(n,name,""))
         c.execute("INSERT OR IGNORE INTO profile_details(number) VALUES (?)",(n,))
         if body.username is not None:
             username=body.username.strip().lstrip("@").lower()
@@ -305,6 +311,52 @@ def update_profile(body:ProfileUpdate,request:Request):
             c.execute("UPDATE profile_details SET bio=? WHERE number=?",(body.bio.strip(),n))
         c.commit()
     return public_profile(n)
+
+class ProfilePatch(BaseModel):
+    first_name:str|None=Field(default=None,max_length=64)
+    last_name:str|None=Field(default=None,max_length=64)
+    username:str|None=Field(default=None,max_length=32)
+    bio:str|None=Field(default=None,max_length=160)
+
+@app.patch("/v1/profile")
+def patch_profile(body:ProfilePatch,request:Request):
+    _,n=session(request)
+    if body.username is not None and body.username and not re.fullmatch(r"[a-zA-Z0-9_]{5,32}",body.username): raise HTTPException(400,"Invalid username")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if body.first_name is not None or body.last_name is not None:
+            old=c.execute("SELECT first_name,last_name FROM profile_names WHERE number=?",(n,)).fetchone()
+            p=c.execute("SELECT name FROM profiles WHERE number=?",(n,)).fetchone()
+            first=body.first_name.strip() if body.first_name is not None else old["first_name"] if old else p["name"] if p else n
+            last=body.last_name.strip() if body.last_name is not None else old["last_name"] if old else ""
+            if not first: raise HTTPException(400,"Empty name")
+            c.execute("INSERT INTO profile_names VALUES (?,?,?) ON CONFLICT(number) DO UPDATE SET first_name=excluded.first_name,last_name=excluded.last_name",(n,first,last))
+            c.execute("INSERT INTO profiles VALUES (?,?) ON CONFLICT(number) DO UPDATE SET name=excluded.name",(n,(first+" "+last).strip()))
+        c.execute("INSERT OR IGNORE INTO profile_details(number) VALUES (?)",(n,))
+        if body.username is not None:
+            try:c.execute("UPDATE profile_details SET username=? WHERE number=?",(body.username.lower() or None,n))
+            except sqlite3.IntegrityError:raise HTTPException(409,"Username taken")
+        if body.bio is not None:c.execute("UPDATE profile_details SET bio=? WHERE number=?",(body.bio.strip(),n))
+        c.commit()
+    return public_profile(n)
+
+@app.get("/v1/username/check")
+def check_username(request:Request,username:str):
+    _,n=session(request)
+    if not re.fullmatch(r"[a-zA-Z0-9_]{5,32}",username):raise HTTPException(400,"Invalid username")
+    with db() as c:
+        occupied=c.execute("SELECT 1 FROM profile_details WHERE username=? COLLATE NOCASE AND number<>?",(username,n)).fetchone()
+    return {"available":not bool(occupied)}
+
+@app.get("/v1/users-search")
+def users_search(request:Request,q:str):
+    _,n=session(request)
+    q=q.strip().lstrip("@")[:64].lower()
+    if len(q)<2:return {"users":[]}
+    if not allow("lookup:"+n):raise HTTPException(429,"Too many requests")
+    with db() as c:
+        rows=c.execute("""SELECT a.number FROM accounts a LEFT JOIN profiles p ON p.number=a.number LEFT JOIN profile_details d ON d.number=a.number LEFT JOIN phone_aliases ph ON ph.number=a.number WHERE a.number<>? AND (instr(lower(COALESCE(p.name,'')),?)>0 OR instr(lower(COALESCE(d.username,'')),?)>0 OR instr(COALESCE(ph.phone,''),?)>0) AND NOT EXISTS(SELECT 1 FROM blocks b WHERE (b.owner=? AND b.peer=a.number) OR (b.owner=a.number AND b.peer=?)) LIMIT 20""",(n,q,q,q,n,n)).fetchall()
+    return {"users":[public_profile(x["number"]) for x in rows]}
 
 @app.get("/v1/users/{number}")
 def lookup(number:str,request:Request):
@@ -493,6 +545,9 @@ def block(number:str,body:BlockUpdate,request:Request):
 class RoomCreate(BaseModel):
     title: str = Field(min_length=1,max_length=80)
     kind: str = Field(max_length=10)
+    about:str=Field(default="",max_length=255)
+    mode:str=Field(default="basic",pattern=r"^(basic|channel)$")
+    members:list[str]=Field(default_factory=list,max_length=100)
 
 class RoomInvite(BaseModel):
     number: str = Field(max_length=40)
@@ -512,19 +567,35 @@ def create_room(body:RoomCreate,request:Request):
     title=body.title.strip()
     if not title or body.kind not in ("group","channel"): raise HTTPException(400,"Invalid room")
     rid=secrets.token_hex(12)
+    members=set(normalize_number(x) for x in body.members)
+    members.discard(n)
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
+        for peer in members:
+            require_peer(c,peer)
+            if c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone():raise HTTPException(403,"Invitation unavailable")
         c.execute("INSERT INTO rooms VALUES (?,?,?,?)",(rid,n,title,body.kind))
+        numeric=c.execute("INSERT INTO room_meta(room_id,about,mode,created) VALUES (?,?,?,?)",(rid,body.about,"channel" if body.kind=="channel" else body.mode,int(time.time()))).lastrowid
         c.execute("INSERT INTO room_members VALUES (?,?)",(rid,n))
+        for peer in members:c.execute("INSERT INTO room_members VALUES (?,?)",(rid,peer))
         c.commit()
-    return {"id":rid,"title":title,"kind":body.kind,"owner":n}
+    return {"id":rid,"numeric_id":numeric,"title":title,"kind":body.kind,"owner":n,"mode":"channel" if body.kind=="channel" else body.mode,"about":body.about,"created":int(time.time()),"members":len(members)+1}
 
 @app.get("/v1/rooms")
 def list_rooms(request:Request):
     _,n=session(request)
     with db() as c:
-        rows=c.execute("SELECT r.*, (SELECT COUNT(*) FROM room_members x WHERE x.room_id=r.id) AS members FROM rooms r JOIN room_members m ON r.id=m.room_id WHERE m.number=? ORDER BY r.title COLLATE NOCASE LIMIT 100",(n,)).fetchall()
+        rows=c.execute("SELECT r.*, meta.numeric_id,meta.mode,meta.about,meta.created, (SELECT COUNT(*) FROM room_members x WHERE x.room_id=r.id) AS members FROM rooms r JOIN room_meta meta ON meta.room_id=r.id JOIN room_members m ON r.id=m.room_id WHERE m.number=? ORDER BY r.title COLLATE NOCASE LIMIT 100",(n,)).fetchall()
     return {"rooms":[dict(row) for row in rows]}
+
+@app.get("/v1/rooms/by-id/{numeric}")
+def room_by_id(numeric:int,request:Request):
+    _,n=session(request)
+    with db() as c:
+        row=c.execute("SELECT r.*,meta.numeric_id,meta.mode,meta.about,meta.created,(SELECT COUNT(*) FROM room_members x WHERE x.room_id=r.id) AS members FROM rooms r JOIN room_meta meta ON meta.room_id=r.id JOIN room_members m ON m.room_id=r.id WHERE meta.numeric_id=? AND m.number=?",(numeric,n)).fetchone()
+        if not row:raise HTTPException(404,"Room not found")
+        members=c.execute("SELECT number FROM room_members WHERE room_id=? LIMIT 100",(row["id"],)).fetchall()
+    return {"room":dict(row),"users":[public_profile(x["number"]) for x in members]}
 
 @app.post("/v1/rooms/{rid}/invite")
 def invite_room(rid:str,body:RoomInvite,request:Request):
@@ -542,11 +613,11 @@ def invite_room(rid:str,body:RoomInvite,request:Request):
     return {"ok":True}
 
 @app.get("/v1/rooms/{rid}/messages")
-def room_history(rid:str,request:Request):
+def room_history(rid:str,request:Request,before:int=0):
     _,n=session(request)
     with db() as c:
         get_room(c,rid,n)
-        rows=c.execute("SELECT m.id,m.sender,m.body AS text,m.created,COALESCE(p.name,m.sender) AS name FROM room_messages m LEFT JOIN profiles p ON p.number=m.sender WHERE m.room_id=? ORDER BY m.id DESC LIMIT 100",(rid,)).fetchall()
+        rows=c.execute("SELECT m.id,m.sender,m.body AS text,m.created,COALESCE(p.name,m.sender) AS name FROM room_messages m LEFT JOIN profiles p ON p.number=m.sender WHERE m.room_id=? AND (?=0 OR m.id<?) ORDER BY m.id DESC LIMIT 100",(rid,before,before)).fetchall()
     return {"messages":[dict(row) for row in reversed(rows)]}
 
 @app.post("/v1/rooms/{rid}/messages")
@@ -559,9 +630,10 @@ def room_send(rid:str,body:RoomText,request:Request):
         c.execute("BEGIN IMMEDIATE")
         row=get_room(c,rid,n)
         if row["kind"]=="channel" and row["owner"]!=n: raise HTTPException(403,"Only owner can post")
-        mid=c.execute("INSERT INTO room_messages(room_id,sender,body,created) VALUES (?,?,?,?)",(rid,n,value,int(time.time()))).lastrowid
+        created=int(time.time())
+        mid=c.execute("INSERT INTO room_messages(room_id,sender,body,created) VALUES (?,?,?,?)",(rid,n,value,created)).lastrowid
         c.commit()
-    return {"id":mid}
+    return {"id":mid,"created":created}
 
 @app.delete("/v1/rooms/{rid}/membership")
 def leave_room(rid:str,request:Request):
