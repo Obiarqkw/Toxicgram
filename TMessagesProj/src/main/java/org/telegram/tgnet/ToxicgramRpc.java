@@ -379,6 +379,27 @@ public final class ToxicgramRpc {
     }
     private static TLObject roomsRpc(int a,TLObject req)throws Exception{
         String self=prefs(a).getString("number","");
+        if(req instanceof TLRPC.TL_messages_getFullChat || req instanceof TLRPC.TL_channels_getFullChannel){
+            long id=req instanceof TLRPC.TL_messages_getFullChat?((TLRPC.TL_messages_getFullChat)req).chat_id:((TLRPC.TL_channels_getFullChannel)req).channel.channel_id;
+            JSONObject info=roomInfo(a,id),row=info.getJSONObject("room");JSONArray members=info.getJSONArray("users");
+            TLRPC.TL_messages_chatFull result=new TLRPC.TL_messages_chatFull();
+            boolean channel="channel".equals(row.optString("mode"));
+            TLRPC.ChatFull full=channel?new TLRPC.TL_channelFull():new TLRPC.TL_chatFull();
+            full.id=id;full.about=row.optString("about","");full.notify_settings=new TLRPC.TL_peerNotifySettings();full.participants_count=row.optInt("members",1);
+            full.chat_photo=new TLRPC.TL_photoEmpty();
+            if(channel){full.flags=1;full.can_view_participants=true;}
+            else {
+                TLRPC.TL_chatParticipants ps=new TLRPC.TL_chatParticipants();ps.chat_id=id;ps.version=1;
+                for(int i=0;i<members.length();i++){
+                    JSONObject p=members.getJSONObject(i);String n=p.getString("number");
+                    TLRPC.ChatParticipant member=n.equals(row.optString("owner"))?new TLRPC.TL_chatParticipantCreator():new TLRPC.TL_chatParticipant();
+                    member.user_id=userId(n);member.inviter_id=userId(row.getString("owner"));member.date=row.optInt("created",1);ps.participants.add(member);
+                }
+                full.participants=ps;
+            }
+            for(int i=0;i<members.length();i++){JSONObject p=members.getJSONObject(i);result.users.add(user(p,self.equals(p.getString("number"))));}
+            result.full_chat=full;result.chats.add(roomChat(row,self));return result;
+        }
         if(req instanceof TLRPC.TL_messages_createChat){
             TLRPC.TL_messages_createChat q=(TLRPC.TL_messages_createChat)req;JSONArray members=new JSONArray();
             for(TLRPC.InputUser u:q.users)members.put(inputUser(a,u));
