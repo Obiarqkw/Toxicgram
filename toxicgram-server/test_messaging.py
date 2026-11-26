@@ -325,5 +325,63 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(client.get("/v1/users/"+b,headers=ha).json()["last_seen"],0)
 
 
+    def test_referral_rewards_only_after_first_successful_login(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server.DB=str(Path(temp)/"test.sqlite3")
+            server.PEPPER="test-only-key-not-for-deployment-0000000"
+            server.TOKEN=""
+            with TestClient(server.app) as client:
+                def verify(n,code):
+                    return client.post("/v1/auth/verify",json={"number":n,"code":code})
+                inviter,code=server.issue(201)
+                first=verify(inviter,code)
+                self.assertEqual(first.status_code,200)
+                h={"Authorization":"Bearer "+first.json()["access_token"]}
+                stats=server.referral_stats(201)
+                ref=stats["code"]
+                self.assertEqual(server.referral_stats(201)["code"],ref)
+                self.assertEqual(stats["balance"],1000)
+                self.assertIsNone(server.referral_stats(999))
+                other,_=server.issue(202)
+                other_ref=server.referral_stats(202)["code"]
+                invited,invite_code=server.issue(203,ref)
+                stats=server.referral_stats(201)
+                self.assertEqual((stats["pending"],stats["completed"],stats["earned"],stats["balance"]),(1,0,0,1000))
+                wrong="000000" if invite_code!="000000" else "111111"
+                self.assertEqual(verify(invited,wrong).status_code,401)
+                self.assertEqual(server.referral_stats(201)["balance"],1000)
+                # Reopening with another referral cannot change attribution.
+                with server.db() as db:
+                    db.execute("UPDATE accounts SET issued=0 WHERE number=?",(invited,))
+                _,invite_code=server.issue(203,other_ref)
+                self.assertEqual(server.referral_stats(202)["total"],0)
+                self.assertEqual(verify(invited,invite_code).status_code,200)
+                stats=server.referral_stats(201)
+                self.assertEqual((stats["pending"],stats["completed"],stats["earned"],stats["balance"]),(0,1,500,1500))
+                self.assertEqual(client.get("/v1/gifts",headers=h).json()["balance"],1500)
+                self.assertEqual(verify(invited,invite_code).status_code,401)
+                # Self-referral, returning users and virtual-number changes cannot pay again.
+                with server.db() as db:
+                    db.execute("UPDATE accounts SET issued=0 WHERE number IN (?,?,?)",(invited,inviter,other))
+                _,next_code=server.issue(203,ref)
+                phone=server.phone_for(invited,"+7")
+                self.assertEqual(verify(phone,next_code).status_code,200)
+                _,self_code=server.issue(201,ref)
+                self.assertEqual(verify(inviter,self_code).status_code,200)
+                _,other_code=server.issue(202,ref)
+                self.assertEqual(verify(other,other_code).status_code,200)
+                self.assertEqual(server.referral_stats(201)["earned"],500)
+                second,second_code=server.issue(204,ref)
+                self.assertEqual(verify(second,second_code).status_code,200)
+                server.init()
+                self.assertEqual(server.referral_stats(201)["completed"],2)
+                self.assertEqual(client.get("/v1/gifts",headers=h).json()["balance"],2000)
+                with server.db() as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM admin_user_actions WHERE number=? AND action='referral.reward'",(inviter,)).fetchone()[0],2)
+                invalid,invalid_code=server.issue(205,"invalid")
+                self.assertEqual(verify(invalid,invalid_code).status_code,200)
+                self.assertEqual(server.referral_stats(201)["completed"],2)
+
+
 if __name__=="__main__":
     unittest.main()
