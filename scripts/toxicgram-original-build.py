@@ -48,8 +48,10 @@ profile=root/"src/main/java/org/telegram/ui/ProfileActivity.java"
 src=profile.read_text(encoding="utf-8")
 old="if (getMessagesController().starsPurchaseAvailable()) {\n                    starsRow = rowCount++;"
 new="if (org.telegram.tgnet.ToxicgramRpc.ENABLED || getMessagesController().starsPurchaseAvailable()) {\n                    starsRow = rowCount++;"
-assert old in src
-src=src.replace(old,new,1)
+if old in src:
+    src=src.replace(old,new,1)
+elif new not in src:
+    raise RuntimeError('Stars row patch target not found in ProfileActivity.java')
 old="                presentFragment(new StarsIntroActivity());"
 new="""                if (org.telegram.tgnet.ToxicgramRpc.ENABLED) {
                     org.telegram.ui.Stars.StarsController.getInstance(currentAccount).getBalance(true, () -> {
@@ -62,7 +64,9 @@ new="""                if (org.telegram.tgnet.ToxicgramRpc.ENABLED) {
                 } else {
                     presentFragment(new StarsIntroActivity());
                 }"""
-assert old in src
-src=src.replace(old,new,1)
+if new not in src:
+    if old not in src:
+        raise RuntimeError('Stars click patch target not found in ProfileActivity.java')
+    src=src.replace(old,new,1)
 src=src.replace("LocaleController.getString(R.string.MenuTelegramStars), c.balanceAvailable()", '(org.telegram.tgnet.ToxicgramRpc.ENABLED ? "Toxic Stars" : LocaleController.getString(R.string.MenuTelegramStars)), c.balanceAvailable()',1)
 profile.write_text(src,encoding="utf-8")
