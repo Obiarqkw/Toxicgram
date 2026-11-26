@@ -4,7 +4,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from fastapi.concurrency import run_in_threadpool
-import base64, binascii
+import base64, binascii, gzip, io
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 DB = os.getenv("TOXICGRAM_DB", "data/toxicgram.sqlite3")
@@ -53,9 +54,14 @@ def init():
         CREATE TABLE IF NOT EXISTS gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, created INTEGER NOT NULL, serial TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS gift_details (gift_id INTEGER PRIMARY KEY, visible INTEGER NOT NULL DEFAULT 0, anonymous INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS gift_orders (sender TEXT NOT NULL, request_id TEXT NOT NULL, gift_id INTEGER NOT NULL, PRIMARY KEY(sender,request_id));
+        CREATE TABLE IF NOT EXISTS catalog_gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT UNIQUE NOT NULL, name TEXT NOT NULL, emoji TEXT NOT NULL DEFAULT '', price INTEGER NOT NULL, supply INTEGER NOT NULL DEFAULT 0, issued INTEGER NOT NULL DEFAULT 0, rarity TEXT NOT NULL DEFAULT 'common', upgrade_enabled INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, art TEXT NOT NULL DEFAULT '', asset TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS gift_art (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+        CREATE TABLE IF NOT EXISTS gift_numbers (gift_id INTEGER PRIMARY KEY, num INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS admin_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, kind TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS stories (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, text TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS story_owner ON stories(owner,created);
         """)
+        seed_catalog(c)
 
 def phone_for(n, prefix=None):
     with db() as c:
@@ -645,12 +651,128 @@ def get_media(mid:str,request:Request):
 CATALOG={"heart":{"name":"Сердце","emoji":"💝","price":50},"bear":{"name":"Мишка","emoji":"🧸","price":100},"rose":{"name":"Роза","emoji":"🌹","price":75},"star":{"name":"Звезда","emoji":"🌟","price":150},"crystal":{"name":"Кристалл","emoji":"💎","price":250}}
 CATALOG.update({"present":{"name":"Подарок","emoji":"🎁","price":100},"cake":{"name":"Торт","emoji":"🎂","price":120}})
 GIFT_ART={"heart":"email_setup_heart","star":"star_reaction","crystal":"wallet_diamond_blue","present":"gift","cake":"cake"}
+def seed_catalog(c):
+    # Stable IDs 1..7 preserve legacy Android gift identifiers.
+    c.execute("BEGIN IMMEDIATE")
+    for index,(kind,item) in enumerate(CATALOG.items(),1):
+        c.execute("INSERT OR IGNORE INTO catalog_gifts(id,kind,name,emoji,price,art) VALUES (?,?,?,?,?,?)",(index,kind,item["name"],item["emoji"],item["price"],GIFT_ART.get(kind,"")))
+    art=Path(__file__).with_name("plush_pepe.json")
+    if art.exists():
+        data=gzip.compress(art.read_bytes(),mtime=0)
+        asset=hashlib.sha256(data).hexdigest()
+        c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
+        c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("plush-pepe","Plush Pepe","🐸",500,1000,"legendary",1,asset))
+    c.commit()
+
+def catalog_item(row):
+    d=dict(row)
+    d["remaining"]=max(0,d["supply"]-d["issued"]) if d["supply"] else None
+    d["gift_id"]=str(830000000000000000+d["id"]-1)
+    return d
+
+def catalog_rows(c,dynamic=False):
+    return [catalog_item(x) for x in c.execute("SELECT * FROM catalog_gifts WHERE (?=1 OR id<=7) ORDER BY id",(int(dynamic),))]
+
+ADMIN_KEY=os.getenv("TOXICGRAM_ADMIN_KEY","")
+def admin_auth(request):
+    scheme,_,value=request.headers.get("Authorization","").partition(" ")
+    if len(ADMIN_KEY)<32: raise HTTPException(503,"Admin disabled")
+    if scheme.lower()!="bearer" or len(value)>256 or not hmac.compare_digest(value.encode(),ADMIN_KEY.encode()):
+        if not allow("admin:invalid"): raise HTTPException(429,"Too many attempts")
+        raise HTTPException(401,"Unauthorized")
+
+@app.get("/admin",response_class=HTMLResponse)
+def admin_page():
+    return HTMLResponse(Path(__file__).with_name("admin.html").read_text(encoding="utf-8"),headers={"Cache-Control":"no-store","Content-Security-Policy":"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer"})
+
+@app.get("/admin/app.js")
+def admin_js():
+    return Response(Path(__file__).with_name("admin.js").read_text(encoding="utf-8"),media_type="application/javascript",headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+
+@app.get("/admin/style.css")
+def admin_css():
+    return Response(Path(__file__).with_name("admin.css").read_text(encoding="utf-8"),media_type="text/css",headers={"X-Content-Type-Options":"nosniff"})
+
+@app.get("/v1/admin/catalog")
+def admin_catalog(request:Request):
+    admin_auth(request)
+    with db() as c:
+        return {"catalog":catalog_rows(c,True),"stats":{"users":c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0],"gifts":c.execute("SELECT COUNT(*) FROM gifts").fetchone()[0],"stars":c.execute("SELECT COALESCE(SUM(balance),0) FROM wallets").fetchone()[0]}}
+
+class CatalogEdit(BaseModel):
+    kind:str=Field(pattern=r"^[a-z0-9][a-z0-9-]{0,23}$")
+    name:str=Field(min_length=1,max_length=64)
+    emoji:str=Field(default="",max_length=16)
+    price:int=Field(ge=1,le=100000000)
+    supply:int=Field(default=0,ge=0,le=100000000)
+    rarity:str=Field(default="common",pattern=r"^(common|rare|epic|legendary)$")
+    upgrade_enabled:bool=False
+    active:bool=True
+    asset:str=Field(default="",pattern=r"^(|[a-f0-9]{64})$")
+
+@app.put("/v1/admin/catalog")
+def edit_catalog(body:CatalogEdit,request:Request):
+    admin_auth(request)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        old=c.execute("SELECT * FROM catalog_gifts WHERE kind=?",(body.kind,)).fetchone()
+        if not old and c.execute("SELECT COUNT(*) FROM catalog_gifts").fetchone()[0]>=200: raise HTTPException(409,"Catalog limit")
+        if body.asset and not c.execute("SELECT 1 FROM gift_art WHERE id=?",(body.asset,)).fetchone(): raise HTTPException(400,"Unknown artwork")
+        if not body.asset and (not old or not old["art"]) and body.active: raise HTTPException(400,"Artwork required")
+        if old and body.supply and body.supply<old["issued"]: raise HTTPException(409,"Supply below issued count")
+        if old:
+            c.execute("UPDATE catalog_gifts SET name=?,emoji=?,price=?,supply=?,rarity=?,upgrade_enabled=?,active=?,asset=? WHERE kind=?",(body.name,body.emoji,body.price,body.supply,body.rarity,int(body.upgrade_enabled),int(body.active),body.asset,body.kind))
+        else:
+            c.execute("INSERT INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,active,asset) VALUES (?,?,?,?,?,?,?,?,?)",(body.kind,body.name,body.emoji,body.price,body.supply,body.rarity,int(body.upgrade_enabled),int(body.active),body.asset))
+        c.execute("INSERT INTO admin_audit(action,kind,created) VALUES (?,?,?)",("catalog.update",body.kind,int(time.time())))
+        c.commit()
+    return {"ok":True}
+
+@app.post("/v1/admin/art")
+async def upload_gift_art(request:Request):
+    admin_auth(request)
+    raw=await read_limited(request,256*1024)
+    try:
+        if raw[:2]==b"\x1f\x8b":
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as f: raw=f.read(1024*1024+1)
+        if len(raw)>1024*1024: raise ValueError()
+        obj=json.loads(raw)
+        if not isinstance(obj,dict) or obj.get("w")!=512 or obj.get("h")!=512 or not 1<=obj.get("fr",0)<=60 or not 0<obj.get("op",0)-obj.get("ip",0)<=180 or not isinstance(obj.get("layers"),list) or not 1<=len(obj["layers"])<=100 or obj.get("assets"): raise ValueError()
+        # Only self-contained vector animations; no external resources or expression strings.
+        def check(x,depth=0):
+            if depth>40: raise ValueError()
+            if isinstance(x,dict):
+                if x.get("ty")==2 or "u" in x or "x" in x and isinstance(x["x"],str): raise ValueError()
+                for v in x.values(): check(v,depth+1)
+            elif isinstance(x,list):
+                for v in x: check(v,depth+1)
+        check(obj)
+        data=gzip.compress(json.dumps(obj,separators=(",",":"),allow_nan=False).encode(),mtime=0)
+        if len(data)>256*1024: raise ValueError()
+    except Exception: raise HTTPException(400,"Use self-contained 512x512 vector Lottie JSON or TGS, maximum 180 frames")
+    asset=hashlib.sha256(data).hexdigest()
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if c.execute("SELECT COALESCE(SUM(length(data)),0) FROM gift_art").fetchone()[0]+len(data)>32*1024*1024: raise HTTPException(409,"Artwork storage limit")
+        c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
+        c.commit()
+    return {"asset":asset}
+
+@app.get("/v1/gift-art/{asset}")
+def gift_art(asset:str):
+    if not re.fullmatch(r"[a-f0-9]{64}",asset): raise HTTPException(404)
+    with db() as c:
+        row=c.execute("SELECT data FROM gift_art WHERE id=? AND EXISTS(SELECT 1 FROM catalog_gifts WHERE asset=?)",(asset,asset)).fetchone()
+    if not row: raise HTTPException(404)
+    return Response(row["data"],media_type="application/x-tgsticker",headers={"Cache-Control":"public,max-age=31536000,immutable","X-Content-Type-Options":"nosniff"})
+
 class GiftSend(BaseModel):
     recipient:str=Field(max_length=40)
     kind:str=Field(max_length=24)
     request_id:str=Field(default="",max_length=80)
     anonymous:bool=False
     message:str=Field(default="",max_length=250)
+    expected_price:int|None=Field(default=None,ge=1)
 
 def gift_row(row,own):
     item=dict(row)
@@ -664,7 +786,7 @@ def profile_gifts(number:str,request:Request):
         require_peer(c,peer)
         if peer!=n and c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone(): raise HTTPException(403,"Gift collection unavailable")
         rows=c.execute("""SELECT g.id,g.kind,g.serial,g.created,g.sender,COALESCE(d.visible,0) AS visible,
-        COALESCE(d.anonymous,0) AS anonymous,COALESCE(d.message,'') AS message FROM gifts g
+        COALESCE(d.anonymous,0) AS anonymous,COALESCE(d.message,'') AS message,gn.num AS num FROM gifts g LEFT JOIN gift_numbers gn ON gn.gift_id=g.id
         LEFT JOIN gift_details d ON d.gift_id=g.id WHERE g.recipient=? AND (?=1 OR d.visible=1)
         ORDER BY g.id DESC LIMIT 100""",(peer,int(peer==n))).fetchall()
     return {"received":[gift_row(x,peer==n) for x in rows]}
@@ -683,20 +805,19 @@ def gift_visibility(gid:int,body:GiftVisibility,request:Request):
     return {"ok":True}
 
 @app.get("/v1/gifts")
-def gift_catalog(request:Request):
+def gift_catalog(request:Request,dynamic:bool=False):
     _,n=session(request)
     with db() as c:
         c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(n,))
         balance=c.execute("SELECT balance FROM wallets WHERE number=?",(n,)).fetchone()[0]
         rows=c.execute("SELECT id,kind,serial,created FROM gifts WHERE recipient=? ORDER BY id DESC LIMIT 100",(n,)).fetchall()
-    return {"balance":balance,"catalog":[{"kind":k,**v,"art":GIFT_ART.get(k,"")} for k,v in CATALOG.items()],"received":[dict(x) for x in rows]}
+        catalog=catalog_rows(c,dynamic)
+    return {"balance":balance,"catalog":catalog,"received":[dict(x) for x in rows]}
 
 @app.post("/v1/gifts")
 def send_gift(body:GiftSend,request:Request):
     _,n=session(request)
     peer=normalize_number(body.recipient)
-    item=CATALOG.get(body.kind)
-    if not item: raise HTTPException(400,"Unknown gift")
     if not allow("gift:"+n): raise HTTPException(429,"Too many requests")
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -707,12 +828,18 @@ def send_gift(body:GiftSend,request:Request):
                 if prior["kind"]!=body.kind or prior["recipient"]!=peer: raise HTTPException(409,"Order mismatch")
                 c.commit()
                 return {"serial":prior["serial"]}
+        item=c.execute("SELECT * FROM catalog_gifts WHERE kind=?",(body.kind,)).fetchone()
+        if not item or not item["active"]: raise HTTPException(400,"Gift unavailable")
+        if body.expected_price is not None and body.expected_price!=item["price"]: raise HTTPException(412,"Price changed")
+        if item["supply"] and item["issued"]>=item["supply"]: raise HTTPException(410,"Sold out")
         if c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone(): raise HTTPException(403,"Gift unavailable")
         c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(n,))
         changed=c.execute("UPDATE wallets SET balance=balance-? WHERE number=? AND balance>=?",(item["price"],n,item["price"])).rowcount
         if not changed: raise HTTPException(409,"Not enough demo stars")
         serial=secrets.token_hex(8)
         gid=c.execute("INSERT INTO gifts(sender,recipient,kind,created,serial) VALUES (?,?,?,?,?)",(n,peer,body.kind,int(time.time()),serial)).lastrowid
+        c.execute("UPDATE catalog_gifts SET issued=issued+1 WHERE id=?",(item["id"],))
+        c.execute("INSERT INTO gift_numbers VALUES (?,?)",(gid,item["issued"]+1))
         c.execute("INSERT INTO gift_details(gift_id,visible,anonymous,message) VALUES (?,?,?,?)",(gid,0,int(body.anonymous),body.message.strip()))
         if body.request_id: c.execute("INSERT INTO gift_orders VALUES (?,?,?)",(n,body.request_id,gid))
         c.commit()
