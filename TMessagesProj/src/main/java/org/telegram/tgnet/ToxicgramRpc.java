@@ -30,6 +30,22 @@ public final class ToxicgramRpc {
     public static final boolean ENABLED=true;
     private static final String BASE="https://toxicgram-auth-production.up.railway.app";
     private static final ExecutorService IO=Executors.newSingleThreadExecutor();
+    private static final ExecutorService PROBES=Executors.newSingleThreadExecutor();
+    private static final java.util.Set<Integer> checking=java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<Integer,Boolean>());
+    public static void probe(int account){
+        if(!checking.add(account))return;
+        PROBES.execute(()->{
+            int state;
+            try{
+                JSONObject health=http("GET","/health",null,null);
+                if(!"ok".equals(health.optString("status")))throw new IOException("Health unavailable");
+                state=ConnectionsManager.ConnectionStateConnected;
+            }catch(Exception e){
+                state=ApplicationLoader.isNetworkOnline()?ConnectionsManager.ConnectionStateConnecting:ConnectionsManager.ConnectionStateWaitingForNetwork;
+            }finally{checking.remove(account);}
+            ConnectionsManager.onToxicgramConnectionStateChanged(state,account);
+        });
+    }
     private static final String KEY="toxicgram_original_session";
     private ToxicgramRpc(){}
     private static SharedPreferences prefs(int a){
@@ -121,7 +137,7 @@ public final class ToxicgramRpc {
             TLObject response=null;TLRPC.TL_error error=null;
             try{response=dispatch(account,request);}
             catch(ApiError e){error=new TLRPC.TL_error();error.code=e.code;error.text=e.type;}
-            catch(Exception e){error=new TLRPC.TL_error();error.code=500;error.text="TOXICGRAM_REQUEST_FAILED";}
+            catch(Exception e){error=new TLRPC.TL_error();error.code=500;error.text="TOXICGRAM_REQUEST_FAILED";if(e instanceof IOException)probe(account);}
             final TLObject result=response;final TLRPC.TL_error failure=error;
             Utilities.stageQueue.postRunnable(()->{
                 if(completion!=null)completion.run(result,failure);
@@ -149,7 +165,7 @@ public final class ToxicgramRpc {
             JSONObject profile=http("GET","/v1/me",null,t);
             TLRPC.TL_auth_authorization auth=new TLRPC.TL_auth_authorization();
             auth.user=user(profile,true);
-            store(a,t,profile.getString("number"));return auth;
+            store(a,t,profile.getString("number"));ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);return auth;
         }
         if(req instanceof TLRPC.TL_auth_logOut){
             http("POST","/v1/auth/logout",null,token(a));prefs(a).edit().clear().commit();
