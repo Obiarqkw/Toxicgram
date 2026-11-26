@@ -418,6 +418,7 @@ def sync_messages(request:Request,after:int=0):
     if after<0:raise HTTPException(400,"Invalid cursor")
     now=int(time.time())
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
         c.execute("INSERT INTO presence VALUES (?,?) ON CONFLICT(number) DO UPDATE SET last_seen=excluded.last_seen",(n,now))
         rows=c.execute("""SELECT m.id,m.sender,m.recipient,m.body AS text,m.created,COALESCE(e.edited,0) AS edited
           FROM messages m LEFT JOIN message_edits e ON e.message_id=m.id
@@ -438,6 +439,7 @@ def sync_messages(request:Request,after:int=0):
             read=c.execute("SELECT last_id FROM read_state WHERE owner=? AND peer=?",(peer,n)).fetchone()
             inbox=c.execute("SELECT last_id FROM read_state WHERE owner=? AND peer=?",(n,peer)).fetchone()
             statuses.append({"number":peer,**st,"read_outbox":read["last_id"] if read else 0,"read_inbox":inbox["last_id"] if inbox else 0})
+        c.commit()
     profiles=[]
     for peer in set(x["sender"] for x in batch):
         p=public_profile(peer)
