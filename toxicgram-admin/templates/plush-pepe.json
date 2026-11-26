@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "slug": "plush-pepe",
+  "name": "Plush Pepe",
+  "price_stars": 500,
+  "total_supply": 1000,
+  "rarity": "legendary",
+  "upgrade_enabled": true,
+  "status": "draft",
+  "artwork": {
+    "format": null,
+    "asset_id": null
+  },
+  "upgrade": {
+    "price_stars": null,
+    "models": [],
+    "backgrounds": [],
+    "symbols": []
+  },
+  "currency": "TOXIC_STARS",
+  "published": false
+}
