@@ -254,5 +254,43 @@ class MessagingTest(unittest.TestCase):
                 server.ADMIN_KEY=previous
 
 
+    def test_original_client_profiles_and_rooms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server.DB=str(Path(temp)/"test.sqlite3")
+            server.PEPPER="test-only-key-not-for-deployment-0000000"
+            server.TOKEN=""
+            with TestClient(server.app) as client:
+                def login(tid):
+                    n,code=server.issue(tid)
+                    res=client.post("/v1/auth/verify",json={"number":n,"code":code})
+                    return n,{"Authorization":"Bearer "+res.json()["access_token"]}
+                a,ha=login(161);b,hb=login(162);c,hc=login(163)
+                path="/v1/profile/partial"
+                result=client.put(path,headers=ha,json={"first_name":"Alex","last_name":"Tester","bio":"Bio text","username":"alex_toxic"})
+                self.assertEqual(result.status_code,200)
+                self.assertEqual(result.json()["name"],"Alex Tester")
+                self.assertEqual(client.put(path,headers=ha,json={"bio":"New bio"}).json()["last_name"],"Tester")
+                self.assertFalse(client.get("/v1/username/check?username=alex_toxic",headers=hb).json()["available"])
+                self.assertEqual(client.put(path,headers=hb,json={"username":"alex_toxic"}).status_code,409)
+                self.assertEqual(client.get("/v1/users-search?q=alex_toxic",headers=hb).json()["users"][0]["number"],a)
+                self.assertEqual(client.get("/v1/me",headers=ha).json()["bio"],"New bio")
+                room=client.post("/v1/rooms",headers=ha,json={"title":"Private group","kind":"group","members":[b]}).json()
+                numeric=room["numeric_id"]
+                details=client.get("/v1/rooms/by-id/"+str(numeric),headers=hb).json()
+                self.assertEqual(len(details["users"]),2)
+                self.assertEqual(client.get("/v1/rooms/by-id/"+str(numeric),headers=hc).status_code,404)
+                self.assertEqual(client.get("/v1/rooms",headers=hb).json()["rooms"][0]["numeric_id"],numeric)
+                msg=client.post("/v1/rooms/"+room["id"]+"/messages",headers=hb,json={"text":"hello group"}).json()
+                self.assertGreater(msg["created"],0)
+                self.assertEqual(client.get("/v1/rooms/"+room["id"]+"/messages",headers=ha).json()["messages"][0]["text"],"hello group")
+                channel=client.post("/v1/rooms",headers=ha,json={"title":"Private channel","kind":"channel","about":"Channel description","members":[b]}).json()
+                self.assertEqual(channel["mode"],"channel")
+                self.assertEqual(channel["about"],"Channel description")
+                self.assertEqual(client.post("/v1/rooms/"+channel["id"]+"/messages",headers=hb,json={"text":"not allowed"}).status_code,403)
+                self.assertEqual(client.post("/v1/rooms/"+channel["id"]+"/messages",headers=ha,json={"text":"channel post"}).status_code,200)
+                server.init()
+                self.assertEqual(client.get("/v1/rooms/by-id/"+str(numeric),headers=hb).json()["room"]["id"],room["id"])
+
+
 if __name__=="__main__":
     unittest.main()
