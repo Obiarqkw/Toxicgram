@@ -13,6 +13,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.Utilities;
+import org.telegram.tgnet.tl.TL_stars;
 import java.io.*;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -145,7 +146,129 @@ public final class ToxicgramRpc {
             });
         });
     }
+    private static final String[] GIFT_KINDS={"heart","bear","rose","star","crystal","present","cake"};
+    private static final String[] GIFT_ART={"email_setup_heart","gift","gift","star_reaction","wallet_diamond_blue","gift","cake"};
+    private static final long GIFT_BASE=830000000000000000L;
+    private static int giftIndex(String kind)throws ApiError{
+        for(int i=0;i<GIFT_KINDS.length;i++)if(GIFT_KINDS[i].equals(kind))return i;
+        throw new ApiError(400,"STARGIFT_INVALID");
+    }
+    private static String giftKind(long id)throws ApiError{
+        long i=id-GIFT_BASE;
+        if(i<0||i>=GIFT_KINDS.length)throw new ApiError(400,"STARGIFT_INVALID");
+        return GIFT_KINDS[(int)i];
+    }
+    // Local upstream Lottie files, not Telegram server-hosted NFT models.
+    public static synchronized String giftAnimationPath(long id){
+        long index=id-GIFT_BASE;
+        if(index<0||index>=GIFT_ART.length)return null;
+        try{
+            String art=GIFT_ART[(int)index];
+            File dir=new File(ApplicationLoader.applicationContext.getCacheDir(),"toxicgram_gift_art");
+            if(!dir.isDirectory()&&!dir.mkdirs())return null;
+            File target=new File(dir,art+".tgs");
+            if(!target.exists()){
+                int resource=ApplicationLoader.applicationContext.getResources().getIdentifier(art,"raw",ApplicationLoader.applicationContext.getPackageName());
+                if(resource==0)return null;
+                File tmp=new File(dir,art+".tmp");
+                try(InputStream in=ApplicationLoader.applicationContext.getResources().openRawResource(resource);
+                    java.util.zip.GZIPOutputStream out=new java.util.zip.GZIPOutputStream(new FileOutputStream(tmp))){
+                    byte[] b=new byte[8192];int n;while((n=in.read(b))!=-1)out.write(b,0,n);
+                }
+                if(!tmp.renameTo(target)){tmp.delete();return null;}
+            }
+            return target.getAbsolutePath();
+        }catch(Exception e){return null;}
+    }
+    private static TL_stars.TL_starGift gift(JSONObject row)throws Exception{
+        int index=giftIndex(row.getString("kind"));
+        TL_stars.TL_starGift g=new TL_stars.TL_starGift();g.id=GIFT_BASE+index;g.stars=row.getLong("price");
+        g.convert_stars=0;g.can_upgrade=false;
+        TLRPC.TL_document d=new TLRPC.TL_document();
+        d.id=g.id;d.access_hash=g.id;d.file_reference=new byte[0];d.date=1;d.mime_type="application/x-tgsticker";d.dc_id=1;
+        String local=giftAnimationPath(d.id);
+        d.size=local==null?0:new File(local).length();
+        TLRPC.TL_documentAttributeSticker sticker=new TLRPC.TL_documentAttributeSticker();sticker.alt=row.optString("emoji","");sticker.stickerset=new TLRPC.TL_inputStickerSetEmpty();
+        d.attributes.add(sticker);
+        TLRPC.TL_documentAttributeFilename filename=new TLRPC.TL_documentAttributeFilename();filename.file_name=GIFT_ART[index]+".tgs";d.attributes.add(filename);
+        TLRPC.TL_documentAttributeImageSize dims=new TLRPC.TL_documentAttributeImageSize();dims.w=512;dims.h=512;d.attributes.add(dims);
+        g.sticker=d;return g;
+    }
+    private static JSONObject findGift(JSONArray catalog,String kind)throws Exception{
+        for(int i=0;i<catalog.length();i++){JSONObject g=catalog.getJSONObject(i);if(kind.equals(g.getString("kind")))return g;}
+        throw new ApiError(400,"STARGIFT_INVALID");
+    }
+    private static final class GiftOrder{
+        final int account;final String recipient,kind,message;final boolean anonymous;final long expires;
+        GiftOrder(int a,String r,String k,String m,boolean h){account=a;recipient=r;kind=k;message=m;anonymous=h;expires=System.currentTimeMillis()+600000;}
+    }
+    private static final java.util.Map<Long,GiftOrder> orders=new java.util.HashMap<>();
+    private static TLObject gifts(int a,TLObject req)throws Exception{
+        if(req instanceof TL_stars.getStarGifts){
+            JSONArray catalog=http("GET","/v1/gifts",null,token(a)).getJSONArray("catalog");
+            TL_stars.TL_starGifts result=new TL_stars.TL_starGifts();result.hash=2;
+            for(int i=0;i<catalog.length();i++){JSONObject row=catalog.getJSONObject(i);if(!row.optString("art","").isEmpty())result.gifts.add(gift(row));}
+            return result;
+        }
+        if(req instanceof TL_stars.TL_payments_getStarsStatus){
+            TL_stars.TL_payments_getStarsStatus q=(TL_stars.TL_payments_getStarsStatus)req;
+            if(q.ton||!peer(a,q.peer).equals(prefs(a).getString("number","")))throw new ApiError(501,"TOXICGRAM_METHOD_NOT_IMPLEMENTED");
+            TL_stars.TL_payments_starsStatus result=new TL_stars.TL_payments_starsStatus();
+            result.balance=TL_stars.StarsAmount.ofStars(http("GET","/v1/gifts",null,token(a)).getLong("balance"));return result;
+        }
+        if(req instanceof TLRPC.TL_payments_getPaymentForm && ((TLRPC.TL_payments_getPaymentForm)req).invoice instanceof TLRPC.TL_inputInvoiceStarGift){
+            TLRPC.TL_inputInvoiceStarGift invoice=(TLRPC.TL_inputInvoiceStarGift)((TLRPC.TL_payments_getPaymentForm)req).invoice;
+            if(invoice.include_upgrade)throw new ApiError(501,"TOXICGRAM_UPGRADE_NOT_IMPLEMENTED");
+            String kind=giftKind(invoice.gift_id),recipient=peer(a,invoice.peer);
+            JSONObject row=findGift(http("GET","/v1/gifts",null,token(a)).getJSONArray("catalog"),kind);
+            long id=new java.security.SecureRandom().nextLong()&Long.MAX_VALUE;
+            orders.entrySet().removeIf(e->e.getValue().expires<System.currentTimeMillis());
+            if(orders.size()>1000)throw new ApiError(429,"FLOOD_WAIT_60");
+            orders.put(id,new GiftOrder(a,recipient,kind,invoice.message==null?"":invoice.message.text,invoice.hide_name));
+            TLRPC.TL_payments_paymentFormStarGift form=new TLRPC.TL_payments_paymentFormStarGift();
+            form.form_id=id;form.invoice=new TLRPC.TL_invoice();form.invoice.currency="XTR";
+            TLRPC.TL_labeledPrice price=new TLRPC.TL_labeledPrice();price.label=row.optString("name");price.amount=row.getLong("price");form.invoice.prices.add(price);
+            return form;
+        }
+        if(req instanceof TL_stars.TL_payments_sendStarsForm){
+            TL_stars.TL_payments_sendStarsForm send=(TL_stars.TL_payments_sendStarsForm)req;
+            if(!(send.invoice instanceof TLRPC.TL_inputInvoiceStarGift))throw new ApiError(501,"TOXICGRAM_METHOD_NOT_IMPLEMENTED");
+            TLRPC.TL_inputInvoiceStarGift invoice=(TLRPC.TL_inputInvoiceStarGift)send.invoice;
+            GiftOrder order=orders.get(send.form_id);
+            if(order==null||order.account!=a||order.expires<System.currentTimeMillis()||!order.recipient.equals(peer(a,invoice.peer))||!order.kind.equals(giftKind(invoice.gift_id)))throw new ApiError(400,"FORM_EXPIRED");
+            try{http("POST","/v1/gifts",new JSONObject().put("kind",order.kind).put("recipient",order.recipient).put("request_id",Long.toString(send.form_id)).put("anonymous",order.anonymous).put("message",order.message),token(a));}
+            catch(ApiError e){if(e.code==409)throw new ApiError(400,"BALANCE_TOO_LOW");throw e;}
+            TLRPC.TL_payments_paymentResult result=new TLRPC.TL_payments_paymentResult();result.updates=new TLRPC.TL_updates();result.updates.date=(int)(System.currentTimeMillis()/1000L);return result;
+        }
+        if(req instanceof TL_stars.getSavedStarGifts){
+            TL_stars.getSavedStarGifts query=(TL_stars.getSavedStarGifts)req;
+            String owner=peer(a,query.peer),t=token(a);
+            TL_stars.TL_payments_savedStarGifts result=new TL_stars.TL_payments_savedStarGifts();
+            if(query.offset!=null&&!query.offset.isEmpty())return result;
+            JSONArray received=http("GET","/v1/users/"+owner+"/gifts",null,t).getJSONArray("received");
+            JSONArray catalog=http("GET","/v1/gifts",null,t).getJSONArray("catalog");
+            for(int i=0;i<received.length();i++){
+                JSONObject row=received.getJSONObject(i);boolean visible=row.optInt("visible")!=0;
+                if((query.exclude_unsaved&&!visible)||(query.exclude_saved&&visible)||query.exclude_unlimited||query.exclude_unupgradable)continue;
+                TL_stars.TL_savedStarGift g=new TL_stars.TL_savedStarGift();g.gift=gift(findGift(catalog,row.getString("kind")));g.date=row.getInt("created");
+                g.msg_id=Math.toIntExact(row.getLong("id"));g.flags=8;g.unsaved=!visible;g.name_hidden=row.optInt("anonymous")!=0;
+                String sender=row.optString("sender");if(!sender.isEmpty()){g.from_id=peerObject(sender);g.flags|=2;}
+                String message=row.optString("message");if(!message.isEmpty()){g.message=new TLRPC.TL_textWithEntities();g.message.text=message;g.flags|=4;}
+                result.gifts.add(g);
+            }
+            result.count=result.gifts.size();return result;
+        }
+        if(req instanceof TL_stars.saveStarGift){
+            TL_stars.saveStarGift save=(TL_stars.saveStarGift)req;
+            if(!(save.stargift instanceof TL_stars.TL_inputSavedStarGiftUser))throw new ApiError(501,"TOXICGRAM_METHOD_NOT_IMPLEMENTED");
+            int id=((TL_stars.TL_inputSavedStarGiftUser)save.stargift).msg_id;
+            http("PUT","/v1/gifts/"+id+"/visibility",new JSONObject().put("visible",!save.unsave),token(a));return new TLRPC.TL_boolTrue();
+        }
+        return null;
+    }
     private static TLObject dispatch(int a,TLObject req)throws Exception{
+        TLObject giftResponse=gifts(a,req);
+        if(giftResponse!=null)return giftResponse;
         if(req instanceof TLRPC.TL_auth_sendCode || req instanceof TLRPC.TL_auth_resendCode){
             String raw=req instanceof TLRPC.TL_auth_sendCode?((TLRPC.TL_auth_sendCode)req).phone_number:((TLRPC.TL_auth_resendCode)req).phone_number;
             if(!phone(raw).matches("\\+(7|1|388)000[0-9]{7}"))throw new ApiError(400,"PHONE_NUMBER_INVALID");
