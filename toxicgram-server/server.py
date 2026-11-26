@@ -35,6 +35,7 @@ def init():
         CREATE TABLE IF NOT EXISTS read_state (owner TEXT NOT NULL, peer TEXT NOT NULL, last_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner,peer));
         CREATE TABLE IF NOT EXISTS message_edits (message_id INTEGER PRIMARY KEY, edited INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS phone_aliases (number TEXT PRIMARY KEY, phone TEXT UNIQUE NOT NULL);
+        CREATE TABLE IF NOT EXISTS used_phones (phone TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS profile_details (number TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE, bio TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS reactions (message_id INTEGER NOT NULL, owner TEXT NOT NULL, emoji TEXT NOT NULL, PRIMARY KEY(message_id,owner));
         CREATE TABLE IF NOT EXISTS blocks (owner TEXT NOT NULL, peer TEXT NOT NULL, PRIMARY KEY(owner,peer));
@@ -56,8 +57,10 @@ def phone_for(n, prefix=None):
             raise ValueError("Unsupported virtual prefix")
         while True:
             phone=prefix+"000"+f"{secrets.randbelow(10000000):07d}"
-            if not c.execute("SELECT 1 FROM phone_aliases WHERE phone=?",(phone,)).fetchone():
+            if not c.execute("SELECT 1 FROM used_phones WHERE phone=? UNION SELECT 1 FROM phone_aliases WHERE phone=?",(phone,phone)).fetchone():
                 break
+        if row: c.execute("INSERT OR IGNORE INTO used_phones VALUES (?)",(row["phone"],))
+        c.execute("INSERT OR IGNORE INTO used_phones VALUES (?)",(phone,))
         c.execute("INSERT INTO phone_aliases VALUES (?,?) ON CONFLICT(number) DO UPDATE SET phone=excluded.phone",(n,phone))
         c.commit()
         return phone
@@ -174,7 +177,7 @@ async def lifespan(app):
 
 app=FastAPI(title="Toxicgram Auth",lifespan=lifespan)
 class Login(BaseModel):
-    number:str=Field(max_length=32)
+    number:str=Field(max_length=40)
     code:str=Field(max_length=16)
 
 @app.get("/health")
@@ -225,7 +228,7 @@ class ProfileUpdate(BaseModel):
     bio: str | None = Field(default=None,max_length=160)
 
 class MessageCreate(BaseModel):
-    recipient: str = Field(max_length=32)
+    recipient: str = Field(max_length=40)
     text: str = Field(min_length=1,max_length=4000)
 
 def normalize_number(value):
