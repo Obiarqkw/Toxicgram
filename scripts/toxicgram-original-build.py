@@ -41,3 +41,28 @@ packages=["com.toxicgram.original","com.toxicgram.original.web","com.toxicgram.o
 config={"project_info":{"project_number":"000000000000","project_id":"toxicgram-offline-build","storage_bucket":"toxicgram-offline-build.invalid"},"client":[{"client_info":{"mobilesdk_app_id":"1:000000000000:android:0000000000000000","android_client_info":{"package_name":p}},"api_key":[{"current_key":"disabled-local-build-placeholder"}]} for p in packages],"configuration_version":"1"}
 for f in Path(".").glob("TMessagesProj*/google-services.json"):
     f.write_text(json.dumps(config),encoding="utf-8")
+
+# Virtual Stars are not Google Play/Telegram billing. Keep the original settings row,
+# and open a read-only real balance screen instead of the external top-up flow.
+profile=root/"src/main/java/org/telegram/ui/ProfileActivity.java"
+src=profile.read_text(encoding="utf-8")
+old="if (getMessagesController().starsPurchaseAvailable()) {\n                    starsRow = rowCount++;"
+new="if (org.telegram.tgnet.ToxicgramRpc.ENABLED || getMessagesController().starsPurchaseAvailable()) {\n                    starsRow = rowCount++;"
+assert old in src
+src=src.replace(old,new,1)
+old="                presentFragment(new StarsIntroActivity());"
+new="""                if (org.telegram.tgnet.ToxicgramRpc.ENABLED) {
+                    org.telegram.ui.Stars.StarsController.getInstance(currentAccount).getBalance(true, () -> {
+                        if (getParentActivity() == null) return;
+                        new org.telegram.ui.ActionBar.AlertDialog.Builder(getParentActivity())
+                            .setTitle("Toxic Stars")
+                            .setMessage("⭐ " + org.telegram.ui.Stars.StarsController.getInstance(currentAccount).getBalance().amount + "\\nВиртуальный баланс Toxicgram. /ref в боте — награды за приглашения.")
+                            .setPositiveButton("OK", null).show();
+                    }, true);
+                } else {
+                    presentFragment(new StarsIntroActivity());
+                }"""
+assert old in src
+src=src.replace(old,new,1)
+src=src.replace("LocaleController.getString(R.string.MenuTelegramStars), c.balanceAvailable()", '(org.telegram.tgnet.ToxicgramRpc.ENABLED ? "Toxic Stars" : LocaleController.getString(R.string.MenuTelegramStars)), c.balanceAvailable()',1)
+profile.write_text(src,encoding="utf-8")
