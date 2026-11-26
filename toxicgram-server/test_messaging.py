@@ -135,5 +135,46 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(client.delete(f"/v1/stories/{sid}",headers=ha).status_code,200)
                 self.assertEqual(client.get("/v1/stories",headers=hb).json()["stories"],[])
 
+    def test_admin_catalog_and_limited_gift(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server.DB=str(Path(temp)/"test.sqlite3")
+            server.PEPPER="test-only-key-not-for-deployment-0000000"
+            server.TOKEN=""
+            previous=server.ADMIN_KEY
+            server.ADMIN_KEY="test-admin-key-not-for-deployment-000000000"
+            admin={"Authorization":"Bearer "+server.ADMIN_KEY}
+            try:
+                with TestClient(server.app) as client:
+                    self.assertEqual(client.get("/admin").status_code,200)
+                    self.assertEqual(client.get("/v1/admin/catalog").status_code,401)
+                    n,code=server.issue(91)
+                    h={"Authorization":"Bearer "+client.post("/v1/auth/verify",json={"number":n,"code":code}).json()["access_token"]}
+                    self.assertEqual(client.get("/v1/admin/catalog",headers=h).status_code,401)
+                    data=client.get("/v1/admin/catalog",headers=admin).json()
+                    pepe=next(g for g in data["catalog"] if g["kind"]=="plush-pepe")
+                    self.assertEqual((pepe["price"],pepe["supply"],pepe["rarity"],pepe["upgrade_enabled"],pepe["active"]),(500,1000,"legendary",1,1))
+                    self.assertEqual(client.get("/v1/gift-art/"+pepe["asset"]).status_code,200)
+                    self.assertEqual(client.post("/v1/admin/art",headers=h,content=b"{}").status_code,401)
+                    self.assertEqual(client.post("/v1/admin/art",headers=admin,content=b"{}").status_code,400)
+                    self.assertNotIn("plush-pepe",[g["kind"] for g in client.get("/v1/gifts",headers=h).json()["catalog"]])
+                    self.assertIn("plush-pepe",[g["kind"] for g in client.get("/v1/gifts?dynamic=true",headers=h).json()["catalog"]])
+                    edit={k:pepe[k] for k in ("kind","name","emoji","price","rarity","asset")}
+                    edit.update(supply=1,upgrade_enabled=True,active=True)
+                    self.assertEqual(client.put("/v1/admin/catalog",headers=h,json=edit).status_code,401)
+                    self.assertEqual(client.put("/v1/admin/catalog",headers=admin,json=edit).status_code,200)
+                    order={"recipient":n,"kind":"plush-pepe","request_id":"one","expected_price":499}
+                    self.assertEqual(client.post("/v1/gifts",headers=h,json=order).status_code,412)
+                    order["expected_price"]=500
+                    first=client.post("/v1/gifts",headers=h,json=order)
+                    self.assertEqual(first.status_code,200)
+                    self.assertEqual(client.post("/v1/gifts",headers=h,json=order).json(),first.json())
+                    order["request_id"]="two"
+                    self.assertEqual(client.post("/v1/gifts",headers=h,json=order).status_code,410)
+                    self.assertEqual(client.get("/v1/gifts",headers=h).json()["balance"],500)
+                    self.assertEqual(client.get("/v1/users/"+n+"/gifts",headers=h).json()["received"][0]["num"],1)
+            finally:
+                server.ADMIN_KEY=previous
+
+
 if __name__=="__main__":
     unittest.main()
