@@ -158,7 +158,9 @@ public final class ToxicgramRpc {
     private static void store(int a,String token,String number)throws Exception{
         Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,key());
         byte[] encrypted=cipher.doFinal(token.getBytes(StandardCharsets.UTF_8));
-        if(!prefs(a).edit().putString("token",Base64.encodeToString(encrypted,Base64.NO_WRAP))
+        SharedPreferences.Editor editor=prefs(a).edit();
+        if(!number.equals(prefs(a).getString("number","")))editor.remove("sync_cursor_v1");
+        if(!editor.putString("token",Base64.encodeToString(encrypted,Base64.NO_WRAP))
             .putString("iv",Base64.encodeToString(cipher.getIV(),Base64.NO_WRAP)).putString("number",number).commit())
             throw new IOException("Cannot persist session");
     }
@@ -556,7 +558,7 @@ public final class ToxicgramRpc {
             JSONObject profile=http("GET","/v1/me",null,t);
             TLRPC.TL_auth_authorization auth=new TLRPC.TL_auth_authorization();
             auth.user=user(profile,true);
-            store(a,t,profile.getString("number"));setForeground(a,true);ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);return auth;
+            setForeground(a,false);store(a,t,profile.getString("number"));setForeground(a,true);ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);return auth;
         }
         if(req instanceof TLRPC.TL_auth_logOut){
             http("POST","/v1/auth/logout",null,token(a));setForeground(a,false);prefs(a).edit().clear().commit();
