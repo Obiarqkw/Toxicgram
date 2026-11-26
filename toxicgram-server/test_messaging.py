@@ -383,5 +383,56 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(server.referral_stats(201)["completed"],2)
 
 
+    def test_voice_video_avatar_and_gift_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server.DB=str(Path(temp)/"test.sqlite3")
+            server.PEPPER="test-only-key-not-for-deployment-0000000"
+            server.TOKEN=""
+            with TestClient(server.app) as client:
+                def login(tid):
+                    n,code=server.issue(tid)
+                    r=client.post("/v1/auth/verify",json={"number":n,"code":code})
+                    return n,{"Authorization":"Bearer "+r.json()["access_token"]}
+                a,ha=login(221);b,hb=login(222);c,hc=login(223)
+                sent=client.post("/v1/gifts",headers=ha,json={"recipient":b,"kind":"heart"})
+                self.assertEqual(sent.status_code,200)
+                self.assertEqual(client.get("/v1/me",headers=hb).json()["gift_count"],1)
+                self.assertEqual(client.get("/v1/users/"+b,headers=ha).json()["gift_count"],0)
+                gid=client.get("/v1/users/"+b+"/gifts",headers=hb).json()["received"][0]["id"]
+                self.assertEqual(client.put(f"/v1/gifts/{gid}/visibility",headers=hb,json={"visible":True}).status_code,200)
+                self.assertEqual(client.get("/v1/users/"+b,headers=ha).json()["gift_count"],1)
+                import base64
+                # PNG fixture, avatar permissions, replacement and removal.
+                png=base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aKp0AAAAASUVORK5CYII=")
+                avatar=client.put("/v1/avatar",headers=ha,content=png)
+                self.assertEqual(avatar.status_code,200)
+                aid=avatar.json()["avatar"]
+                self.assertEqual(client.get("/v1/users/"+a,headers=hb).json()["avatar"],aid)
+                self.assertEqual(client.get("/v1/media/"+aid,headers=hb).content,png)
+                self.assertEqual(client.get("/v1/media/"+aid).status_code,401)
+                self.assertEqual(client.delete("/v1/avatar",headers=ha).status_code,200)
+                self.assertEqual(client.get("/v1/media/"+aid,headers=hb).status_code,404)
+                # Container signatures are validated; full decoder playback is a device test.
+                voice=b"OggS"+bytes(80)
+                params={"recipient":b,"name":"voice.ogg","mime":"audio/ogg","kind":"voice","duration":3,"request_id":"123"}
+                result=client.post("/v1/attachments",headers=ha,params=params,content=voice)
+                self.assertEqual(result.status_code,200)
+                self.assertEqual(client.post("/v1/attachments",headers=ha,params=params,content=voice).json(),result.json())
+                msg=result.json()
+                self.assertEqual(client.get("/v1/media/"+msg["attachment"],headers=hb).content,voice)
+                self.assertEqual(client.get("/v1/media/"+msg["attachment"],headers=hc).status_code,404)
+                sync=client.get("/v1/sync",headers=hb).json()
+                self.assertEqual(len(sync["messages"]),1)
+                self.assertEqual(sync["messages"][0]["attachment"]["kind"],"voice")
+                self.assertEqual(sync["messages"][0]["attachment"]["duration"],3)
+                self.assertEqual(client.post("/v1/attachments",headers=ha,params={**params,"request_id":"124"},content=b"invalid").status_code,400)
+                video=b"\\x00\\x00\\x00\\x18ftypmp42"+bytes(80)
+                v=client.post("/v1/attachments",headers=ha,params={"recipient":b,"name":"video.mp4","mime":"video/mp4","kind":"round","duration":5,"width":360,"height":360,"request_id":"125"},content=video)
+                self.assertEqual(v.status_code,200)
+                msgs=client.get("/v1/chats/"+a+"/messages",headers=hb).json()["messages"]
+                self.assertEqual(msgs[-1]["attachment"]["kind"],"round")
+                self.assertEqual(msgs[-1]["attachment"]["width"],360)
+
+
 if __name__=="__main__":
     unittest.main()
