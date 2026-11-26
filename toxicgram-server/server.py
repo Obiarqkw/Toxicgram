@@ -662,6 +662,12 @@ def seed_catalog(c):
         asset=hashlib.sha256(data).hexdigest()
         c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
         c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("plush-pepe","Plush Pepe","🐸",500,1000,"legendary",1,asset))
+        # Apply the requested redesign exactly once, preserving later Admin edits.
+        c.execute("CREATE TABLE IF NOT EXISTS catalog_migrations (name TEXT PRIMARY KEY)")
+        applied=c.execute("INSERT OR IGNORE INTO catalog_migrations VALUES (?)",("plush-pepe-art-v2",)).rowcount
+        if applied:
+            c.execute("UPDATE catalog_gifts SET asset=? WHERE kind=?", (asset,"plush-pepe"))
+            c.execute("INSERT INTO admin_audit(action,kind,created) VALUES (?,?,?)",("artwork.redesign.v2","plush-pepe",int(time.time())))
     c.commit()
 
 def catalog_item(row):
