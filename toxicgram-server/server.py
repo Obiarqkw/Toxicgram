@@ -56,6 +56,8 @@ def init():
         CREATE TABLE IF NOT EXISTS room_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS room_history ON room_messages(room_id,id);
         CREATE TABLE IF NOT EXISTS media (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, content BLOB NOT NULL, size INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS attachment_details (media_id TEXT PRIMARY KEY, kind TEXT NOT NULL, duration INTEGER NOT NULL DEFAULT 0, width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS attachment_orders (sender TEXT NOT NULL, request_id TEXT NOT NULL, message_id INTEGER NOT NULL, signature TEXT NOT NULL, PRIMARY KEY(sender,request_id));
         CREATE TABLE IF NOT EXISTS message_media (message_id INTEGER PRIMARY KEY, media_id TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS avatars (number TEXT PRIMARY KEY, media_id TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS wallets (number TEXT PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 1000);
@@ -96,14 +98,14 @@ def phone_for(n, prefix=None):
         c.commit()
         return phone
 
-def public_profile(n):
+def public_profile(n,own=False):
     phone=phone_for(n)
     with db() as c:
         row=c.execute("SELECT name FROM profiles WHERE number=?",(n,)).fetchone()
         details=c.execute("SELECT username,bio FROM profile_details WHERE number=?",(n,)).fetchone()
         avatar=c.execute("SELECT media_id FROM avatars WHERE number=?",(n,)).fetchone()
         names=c.execute("SELECT first_name,last_name FROM profile_names WHERE number=?",(n,)).fetchone()
-        gift_count=c.execute("SELECT COUNT(*) FROM gifts g LEFT JOIN gift_details d ON g.id=d.gift_id WHERE g.recipient=? AND d.visible=1",(n,)).fetchone()[0]
+        gift_count=c.execute("SELECT COUNT(*) FROM gifts g LEFT JOIN gift_details d ON g.id=d.gift_id WHERE g.recipient=? AND (?=1 OR d.visible=1)",(n,int(own))).fetchone()[0]
     return {"first_name":names["first_name"] if names else (row["name"] if row else phone),"last_name":names["last_name"] if names else "","gift_count":gift_count,"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
 
 def digest(s):
@@ -315,7 +317,7 @@ def session(request):
 
 @app.get("/v1/me")
 def me(request:Request):
-    return public_profile(session(request)[1])
+    return public_profile(session(request)[1],own=True)
 
 @app.post("/v1/auth/logout")
 def logout(request:Request):
@@ -437,7 +439,7 @@ def lookup(number:str,request:Request):
     with db() as c:
         require_peer(c,peer)
         pass
-    p=public_profile(peer)
+    p=public_profile(peer,own=peer==n)
     with db() as c:p.update(visible_presence(c,n,peer))
     return p
 
@@ -507,12 +509,19 @@ def sync_messages(request:Request,after:int=0):
             inbox=c.execute("SELECT last_id FROM read_state WHERE owner=? AND peer=?",(n,peer)).fetchone()
             statuses.append({"number":peer,**st,"read_outbox":read["last_id"] if read else 0,"read_inbox":inbox["last_id"] if inbox else 0})
         c.commit()
+    delivered=[]
+    with db() as c:
+        for row in batch:
+            item=dict(row)
+            attachment=c.execute("SELECT m.id,m.name,m.mime,m.size,COALESCE(d.kind,'file') AS kind,COALESCE(d.duration,0) AS duration,COALESCE(d.width,0) AS width,COALESCE(d.height,0) AS height FROM media m JOIN message_media a ON a.media_id=m.id LEFT JOIN attachment_details d ON d.media_id=m.id WHERE a.message_id=?",(item["id"],)).fetchone()
+            item["attachment"]=dict(attachment) if attachment else None
+            delivered.append(item)
     profiles=[]
     for peer in set(x["sender"] for x in batch):
         p=public_profile(peer)
         st=next((x for x in statuses if x["number"]==peer),{})
         p.update(st);profiles.append(p)
-    return {"messages":[dict(x) for x in batch],"users":profiles,"statuses":statuses,"cursor":cursor,"more":len(rows)>100,"server_time":now}
+    return {"messages":delivered,"users":profiles,"statuses":statuses,"cursor":cursor,"more":len(rows)>100,"server_time":now}
 
 @app.get("/v1/chats/{number}/messages")
 def history(number:str,request:Request,after:int=0,before:int=0):
@@ -533,7 +542,7 @@ def history(number:str,request:Request,after:int=0,before:int=0):
         result=[]
         for row in rows:
             item=dict(row)
-            attachment=c.execute("SELECT m.id,m.name,m.mime,m.size FROM media m JOIN message_media a ON a.media_id=m.id WHERE a.message_id=?",(item["id"],)).fetchone()
+            attachment=c.execute("SELECT m.id,m.name,m.mime,m.size,COALESCE(d.kind,'file') AS kind,COALESCE(d.duration,0) AS duration,COALESCE(d.width,0) AS width,COALESCE(d.height,0) AS height FROM media m JOIN message_media a ON a.media_id=m.id LEFT JOIN attachment_details d ON d.media_id=m.id WHERE a.message_id=?",(item["id"],)).fetchone()
             item["attachment"]=dict(attachment) if attachment else None
             item["reactions"]=[dict(x) for x in c.execute("SELECT emoji,COUNT(*) AS count FROM reactions WHERE message_id=? GROUP BY emoji",(item["id"],))]
             item["read"]=bool(c.execute("SELECT 1 FROM read_state WHERE owner=? AND peer=? AND last_id>=?",(item["recipient"],item["sender"],item["id"])).fetchone()) or item["recipient"]==item["sender"]
@@ -800,26 +809,39 @@ def store_media(c,n,name,mime,raw):
     c.execute("INSERT INTO media VALUES (?,?,?,?,?,?)",(mid,n,name,mime,raw,len(raw)))
     return mid
 
-def put_attachment(n,peer,name,declared,raw):
+def put_attachment(n,peer,name,declared,raw,kind="file",duration=0,width=0,height=0,request_id="",caption=""):
+    signature=hashlib.sha256(raw).hexdigest()+":"+peer+":"+kind+":"+name+":"+str(duration)+":"+str(width)+":"+str(height)+":"+caption
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         require_peer(c,peer)
         if c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone(): raise HTTPException(403,"Messaging unavailable")
+        if request_id:
+            previous=c.execute("SELECT o.signature,m.id,m.created,a.media_id FROM attachment_orders o JOIN messages m ON m.id=o.message_id JOIN message_media a ON a.message_id=m.id WHERE o.sender=? AND o.request_id=?",(n,request_id)).fetchone()
+            if previous:
+                if previous["signature"]!=signature:raise HTTPException(409,"Upload request mismatch")
+                return {"id":previous["id"],"attachment":previous["media_id"],"created":previous["created"]}
+            if c.execute("SELECT 1 FROM attachment_orders WHERE sender=? AND request_id=?",(n,request_id)).fetchone():raise HTTPException(409,"Upload already used")
         mime=file_mime(raw,declared)
+        if kind=="voice" and mime not in ("audio/ogg","audio/mp4","audio/mpeg"):raise HTTPException(400,"Invalid voice message")
+        if kind=="round" and mime!="video/mp4":raise HTTPException(400,"Invalid video message")
         aid=store_media(c,n,name,mime,raw)
-        mid=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,"📎 "+name,int(time.time()))).lastrowid
+        created=int(time.time())
+        mid=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,caption if kind in ("voice","round") else caption or "📎 "+name,created)).lastrowid
         c.execute("INSERT INTO message_media VALUES (?,?)",(mid,aid))
+        c.execute("INSERT INTO attachment_details VALUES (?,?,?,?,?)",(aid,kind,duration,width,height))
+        if request_id:c.execute("INSERT INTO attachment_orders VALUES (?,?,?,?)",(n,request_id,mid,signature))
         c.commit()
-    return {"id":mid,"attachment":aid}
+    return {"id":mid,"attachment":aid,"created":created}
 
 @app.post("/v1/attachments")
-async def upload_attachment(request:Request,recipient:str,name:str="file",mime:str="application/octet-stream"):
+async def upload_attachment(request:Request,recipient:str,name:str="file",mime:str="application/octet-stream",kind:str="file",duration:int=0,width:int=0,height:int=0,request_id:str="",caption:str=""):
+    if kind not in ("file","voice","round") or not 0<=duration<=3600 or not 0<=width<=4096 or not 0<=height<=4096 or len(caption)>1024 or (request_id and not re.fullmatch(r"-?[0-9]{1,20}",request_id)):raise HTTPException(400,"Invalid attachment metadata")
     _,n=await run_in_threadpool(session,request)
     if not await run_in_threadpool(allow,"upload:"+n): raise HTTPException(429,"Too many uploads")
     peer=await run_in_threadpool(normalize_number,recipient)
     name=re.sub(r"[\x00-\x1f/\\]","_",name.strip())[:120] or "file"
     raw=await read_limited(request,MAX_MEDIA)
-    return await run_in_threadpool(put_attachment,n,peer,name,mime,raw)
+    return await run_in_threadpool(put_attachment,n,peer,name,mime,raw,kind,duration,width,height,request_id,caption)
 
 def put_avatar(n,raw):
     mime=file_mime(raw,"")
@@ -837,6 +859,16 @@ async def upload_avatar(request:Request):
     _,n=await run_in_threadpool(session,request)
     if not await run_in_threadpool(allow,"avatar:"+n): raise HTTPException(429,"Too many uploads")
     return await run_in_threadpool(put_avatar,n,await read_limited(request,MAX_AVATAR))
+
+@app.delete("/v1/avatar")
+def remove_avatar(request:Request):
+    _,n=session(request)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM media WHERE id IN (SELECT media_id FROM avatars WHERE number=?)",(n,))
+        c.execute("DELETE FROM avatars WHERE number=?",(n,))
+        c.commit()
+    return {"ok":True}
 
 @app.get("/v1/media/{mid}")
 def get_media(mid:str,request:Request):
