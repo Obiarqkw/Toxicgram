@@ -11,6 +11,11 @@ import android.widget.*;
 import android.text.InputType;
 import android.text.InputFilter;
 import org.json.JSONObject;
+import org.json.JSONArray;
+import android.os.Handler;
+import android.os.Looper;
+import android.content.ClipboardManager;
+import android.content.ClipData;
 import java.net.URL;
 import javax.net.ssl.HttpsURLConnection;
 import java.io.*;
@@ -28,6 +33,8 @@ public class MainActivity extends Activity {
     private TextView status;
     private EditText number, code;
     private Button submit;
+    private int page=0;
+    private final Handler timer=new Handler(Looper.getMainLooper());
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         getWindow().setStatusBarColor(BG);
@@ -39,6 +46,7 @@ public class MainActivity extends Activity {
         GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(radius));return d;
     }
     void screen(){
+        page++;timer.removeCallbacksAndMessages(null);
         ScrollView sc=new ScrollView(this);sc.setFillViewport(true);sc.setBackgroundColor(BG);
         root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setPadding(dp(24),dp(48),dp(24),dp(28));
         root.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -91,16 +99,102 @@ public class MainActivity extends Activity {
             }
         });
     }
-    void showAccount(){
-        screen();text("Toxicgram",30,INK,true,28);text("Вы вошли в аккаунт",20,INK,true,12);
-        text(account,24,PURPLE,true,24);
-        text("Тестовая сборка регистрации. Чаты пока не подключены.",15,MUTED,false,18);
-        Button out=button("Выйти");status=text("",14,MUTED,false,12);
-        out.setOnClickListener(v->{out.setEnabled(false);String token=session;network.execute(()->{
-            try{request("POST","/v1/auth/logout",null,token);runOnUiThread(()->{session=null;account=null;if(!isDestroyed())showLogin();});}
-            catch(Exception e){runOnUiThread(()->{if(!isDestroyed()){out.setEnabled(true);status.setText("Не удалось завершить сеанс. Повторите попытку.");}});}
-        });});
+    interface Result { void accept(JSONObject data) throws Exception; }
+    void call(String method,String path,JSONObject body,Result done,TextView error,Button busy){
+        final int current=page;final String token=session;
+        if(busy!=null)busy.setEnabled(false);
+        network.execute(()->{
+            try {
+                JSONObject data=request(method,path,body,token);
+                runOnUiThread(()->{
+                    if(isDestroyed()||current!=page)return;
+                    if(busy!=null)busy.setEnabled(true);
+                    try{done.accept(data);}catch(Exception e){if(error!=null)error.setText("Не удалось обработать ответ.");}
+                });
+            } catch(Exception e){
+                runOnUiThread(()->{
+                    if(isDestroyed()||current!=page)return;
+                    if(busy!=null)busy.setEnabled(true);
+                    if(e instanceof ApiError&&((ApiError)e).status==401){session=null;account=null;showLogin();status.setText("Сеанс завершён. Войдите снова.");return;}
+                    if(error!=null)error.setText(e instanceof ApiError&&((ApiError)e).status==404?"Аккаунт не найден.":e instanceof ApiError&&((ApiError)e).status==429?"Слишком много запросов.":"Ошибка соединения. Повторите позже.");
+                });
+            }
+        });
     }
+    JSONObject data(String key,String value){
+        JSONObject o=new JSONObject();try{o.put(key,value);}catch(Exception ignored){}return o;
+    }
+    void showAccount(){
+        screen();
+        text("Toxicgram",30,INK,true,12);
+        TextView identity=text(account,15,MUTED,false,12);
+        identity.setOnClickListener(v->{
+            ClipboardManager clipboard=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+            clipboard.setPrimaryClip(ClipData.newPlainText("Toxicgram ID",account));
+            Toast.makeText(this,"Номер скопирован",Toast.LENGTH_SHORT).show();
+        });
+        Button profile=button("Мой профиль");profile.setOnClickListener(v->showProfile());
+        text("Чаты",23,INK,true,8);
+        EditText peer=field("Номер друга TG-1234-5678",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS,16);
+        Button open=button("Начать чат");
+        TextView info=text("",14,MUTED,false,8);
+        open.setOnClickListener(v->{
+            String id=peer.getText().toString().trim().toUpperCase(Locale.ROOT);
+            if(!id.matches("TG-[0-9]{4}-[0-9]{4}")){info.setText("Введите номер Toxicgram.");return;}
+            call("GET","/v1/users/"+id,null,d->showChat(id,d.getString("name")),info,open);
+        });
+        LinearLayout list=new LinearLayout(this);list.setOrientation(LinearLayout.VERTICAL);root.addView(list,new LinearLayout.LayoutParams(-1,-2));
+        Button refresh=button("Обновить чаты");
+        Runnable load=()->call("GET","/v1/chats",null,d->{
+            list.removeAllViews();JSONArray arr=d.getJSONArray("chats");
+            if(arr.length()==0){TextView empty=new TextView(this);empty.setTextColor(MUTED);empty.setText("Пока нет сообщений");empty.setPadding(dp(8),dp(16),dp(8),dp(16));list.addView(empty);}
+            for(int i=0;i<arr.length();i++){
+                JSONObject row=arr.getJSONObject(i);String id=row.getString("number"),name=row.getString("name");
+                TextView item=new TextView(this);item.setText(name+"\n"+row.optString("text"));item.setTextColor(INK);item.setTextSize(16);item.setMaxLines(2);item.setPadding(dp(16),dp(14),dp(16),dp(14));item.setBackground(shape(CARD,12));
+                LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.bottomMargin=dp(8);list.addView(item,p);item.setOnClickListener(v->showChat(id,name));
+            }
+            info.setText("");
+        },info,refresh);
+        refresh.setOnClickListener(v->load.run());load.run();
+        Button out=button("Выйти");
+        out.setOnClickListener(v->call("POST","/v1/auth/logout",null,d->{session=null;account=null;showLogin();},info,out));
+    }
+    void showProfile(){
+        screen();text("Мой профиль",28,INK,true,16);text(account,16,MUTED,false,24);
+        EditText name=field("Имя",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,64);
+        Button save=button("Сохранить");TextView info=text("",14,MUTED,false,12);
+        call("GET","/v1/profile",null,d->name.setText(d.getString("name")),info,save);
+        save.setOnClickListener(v->{String value=name.getText().toString().trim();if(value.isEmpty()){info.setText("Введите имя.");return;}call("PUT","/v1/profile",data("name",value),d->showAccount(),info,save);});
+        button("Назад").setOnClickListener(v->showAccount());
+    }
+    void showChat(String peer,String name){
+        screen();final int current=page;
+        text(name,24,INK,true,4);text(peer,13,MUTED,false,12);
+        button("‹ Чаты").setOnClickListener(v->showAccount());
+        LinearLayout history=new LinearLayout(this);history.setOrientation(LinearLayout.VERTICAL);
+        ScrollView messages=new ScrollView(this);messages.addView(history);root.addView(messages,new LinearLayout.LayoutParams(-1,dp(300)));
+        EditText composer=field("Сообщение",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,4000);
+        Button send=button("Отправить");TextView info=text("",14,MUTED,false,8);
+        final long[] last={-1};
+        Runnable load=()->call("GET","/v1/chats/"+peer+"/messages",null,d->{
+            JSONArray arr=d.getJSONArray("messages");long newest=arr.length()==0?0:arr.getJSONObject(arr.length()-1).getLong("id");
+            if(newest==last[0])return;last[0]=newest;history.removeAllViews();
+            for(int i=0;i<arr.length();i++){
+                JSONObject msg=arr.getJSONObject(i);boolean mine=account.equals(msg.getString("sender"));
+                TextView bubble=new TextView(this);bubble.setText(msg.getString("text"));bubble.setTextColor(INK);bubble.setTextSize(16);bubble.setPadding(dp(14),dp(10),dp(14),dp(10));bubble.setMaxWidth(dp(280));bubble.setBackground(shape(mine?0xff5539a5:CARD,16));
+                LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-2,-2);p.gravity=mine?Gravity.RIGHT:Gravity.LEFT;p.bottomMargin=dp(8);history.addView(bubble,p);
+            }
+            messages.post(()->messages.fullScroll(View.FOCUS_DOWN));
+        },info,null);
+        send.setOnClickListener(v->{
+            String value=composer.getText().toString().trim();if(value.isEmpty())return;
+            JSONObject body=data("recipient",peer);try{body.put("text",value);}catch(Exception ignored){}
+            call("POST","/v1/messages",body,d->{if(composer.getText().toString().trim().equals(value))composer.setText("");info.setText("");load.run();},info,send);
+        });
+        load.run();
+        timer.postDelayed(new Runnable(){public void run(){if(isDestroyed()||page!=current)return;if(hasWindowFocus())load.run();timer.postDelayed(this,5000);}},5000);
+    }
+    @Override public void onBackPressed(){if(session!=null){showAccount();}else super.onBackPressed();}
     static class ApiError extends IOException{int status;ApiError(int s){status=s;}}
     JSONObject request(String method,String path,JSONObject body,String token)throws Exception{
         HttpsURLConnection conn=(HttpsURLConnection)new URL(BASE+path).openConnection();
@@ -111,10 +205,10 @@ public class MainActivity extends Activity {
             if(body!=null){conn.setDoOutput(true);conn.setRequestProperty("Content-Type","application/json");try(OutputStream out=conn.getOutputStream()){out.write(body.toString().getBytes(StandardCharsets.UTF_8));}}
             int response=conn.getResponseCode();if(response<200||response>=300)throw new ApiError(response);
             try(InputStream in=conn.getInputStream();ByteArrayOutputStream out=new ByteArrayOutputStream()){
-                byte[] b=new byte[4096];int count;while((count=in.read(b))!=-1){if(out.size()+count>65536)throw new IOException("Too large");out.write(b,0,count);}
+                byte[] b=new byte[4096];int count;while((count=in.read(b))!=-1){if(out.size()+count>2097152)throw new IOException("Too large");out.write(b,0,count);}
                 return new JSONObject(out.toString("UTF-8"));
             }
         }finally{conn.disconnect();}
     }
-    @Override protected void onDestroy(){network.shutdownNow();super.onDestroy();}
+    @Override protected void onDestroy(){timer.removeCallbacksAndMessages(null);network.shutdownNow();super.onDestroy();}
 }
