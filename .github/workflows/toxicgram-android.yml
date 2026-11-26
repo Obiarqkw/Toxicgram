@@ -1,0 +1,35 @@
+name: Toxicgram Android APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'toxicgram-android/**'
+      - '.github/workflows/toxicgram-android.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            toxicgram-android
+            gradle/wrapper
+            gradlew
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Build
+        run: bash gradlew -p toxicgram-android :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Toxicgram-auth-debug
+          path: toxicgram-android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
