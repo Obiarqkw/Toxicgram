@@ -15,6 +15,10 @@ import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.Utilities;
 import org.telegram.tgnet.tl.TL_stars;
 import org.telegram.tgnet.tl.TL_account;
+import org.telegram.tgnet.tl.TL_update;
+import org.telegram.messenger.MessagesController;
+import org.telegram.messenger.MessagesStorage;
+import org.telegram.messenger.UserConfig;
 import java.io.*;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -47,6 +51,96 @@ public final class ToxicgramRpc {
             }finally{checking.remove(account);}
             ConnectionsManager.onToxicgramConnectionStateChanged(state,account);
         });
+    }
+    // Foreground polling is separate from outgoing RPCs, so a stalled network
+    // request does not prevent sending. At most one sync per account.
+    private static final java.util.concurrent.ScheduledExecutorService SYNC=Executors.newScheduledThreadPool(2);
+    private static final java.util.Map<Integer,Poll> polls=new java.util.HashMap<>();
+    private static final class Poll{
+        volatile boolean active=true;
+        volatile java.util.concurrent.ScheduledFuture<?> future;
+        int failures=0;
+        boolean first=true;
+        final java.util.Map<String,Integer> readOut=new java.util.HashMap<>(),readIn=new java.util.HashMap<>();
+    }
+    public static synchronized void setForeground(int a,boolean foreground){
+        Poll old=polls.get(a);
+        if(!foreground){
+            if(old!=null){old.active=false;if(old.future!=null)old.future.cancel(false);polls.remove(a);}
+            return;
+        }
+        if(old!=null&&old.active)return;
+        Poll p=new Poll();polls.put(a,p);scheduleSync(a,p,0);
+    }
+    private static void scheduleSync(int a,Poll p,long delay){
+        synchronized(ToxicgramRpc.class){if(p.active&&polls.get(a)==p)p.future=SYNC.schedule(()->poll(a,p),delay,java.util.concurrent.TimeUnit.SECONDS);}
+    }
+    private static TLRPC.UserStatus presence(JSONObject row){
+        int last=row.optInt("last_seen",0),until=row.optInt("online_until",0);
+        if(until>System.currentTimeMillis()/1000L){TLRPC.TL_userStatusOnline s=new TLRPC.TL_userStatusOnline();s.expires=until;return s;}
+        if(last>0){TLRPC.TL_userStatusOffline s=new TLRPC.TL_userStatusOffline();s.expires=last;return s;}
+        return new TLRPC.TL_userStatusEmpty();
+    }
+    private static void poll(int a,Poll p){
+        if(!p.active)return;
+        if(!UserConfig.getInstance(a).isClientActivated()){scheduleSync(a,p,5);return;}
+        try{
+            String t=token(a),self=prefs(a).getString("number","");
+            if(self.isEmpty()){scheduleSync(a,p,5);return;}
+            long cursor=prefs(a).getLong("sync_cursor_v1",0);
+            JSONObject response=http("GET","/v1/sync?after="+cursor,null,t);
+            if(!p.active||!t.equals(token(a)))return;
+            JSONArray incoming=response.getJSONArray("messages"),profiles=response.getJSONArray("users"),statuses=response.getJSONArray("statuses");
+            java.util.ArrayList<TLRPC.User> users=new java.util.ArrayList<>();
+            java.util.ArrayList<TLRPC.Update> events=new java.util.ArrayList<>();
+            for(int i=0;i<profiles.length();i++)users.add(user(profiles.getJSONObject(i),false));
+            // Read markers precede message delivery to avoid replaying already-read
+            // messages as unread after a reconnect.
+            for(int i=0;i<statuses.length();i++){
+                JSONObject row=statuses.getJSONObject(i);String n=row.getString("number");
+                TL_update.TL_updateUserStatus status=new TL_update.TL_updateUserStatus();status.user_id=userId(n);status.status=presence(row);events.add(status);
+                int out=row.optInt("read_outbox",0),in=row.optInt("read_inbox",0);
+                if(out>0&&out>p.readOut.getOrDefault(n,0)){
+                    TL_update.TL_updateReadHistoryOutbox read=new TL_update.TL_updateReadHistoryOutbox();read.peer=peerObject(n);read.max_id=out;events.add(read);p.readOut.put(n,out);
+                }
+                if(in>0&&in>p.readIn.getOrDefault(n,0)){
+                    TL_update.TL_updateReadHistoryInbox read=new TL_update.TL_updateReadHistoryInbox();read.peer=peerObject(n);read.max_id=in;events.add(read);p.readIn.put(n,in);
+                }
+            }
+            for(int i=0;i<incoming.length();i++){
+                TLRPC.TL_message m=message(incoming.getJSONObject(i),self);
+                // The conversation can already have been loaded from history.
+                if(MessagesStorage.getInstance(a).getMessage(m.peer_id.user_id,m.id)!=null)continue;
+                TL_update.TL_updateNewMessage event=new TL_update.TL_updateNewMessage();event.message=m;events.add(event);
+            }
+            long next=response.getLong("cursor");boolean more=response.optBoolean("more",false);
+            int date=response.getInt("server_time");
+            Utilities.stageQueue.postRunnable(()->{
+                try{
+                    if(!p.active||!t.equals(token(a)))return;
+                    if(!MessagesController.getInstance(a).processUpdateArray(events,users,new java.util.ArrayList<TLRPC.Chat>(),true,date)){
+                        p.readOut.clear();p.readIn.clear();scheduleSync(a,p,5);return;
+                    }
+                    // Persist cursor behind the storage queue after incoming messages.
+                    MessagesStorage.getInstance(a).getStorageQueue().postRunnable(()->{
+                        try{
+                            if(p.active&&t.equals(token(a))){
+                                prefs(a).edit().putLong("sync_cursor_v1",next).commit();
+                                p.failures=0;
+                                ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);
+                                scheduleSync(a,p,more?0:4);
+                            }
+                        }catch(Exception ignored){scheduleSync(a,p,5);}
+                    });
+                }catch(Exception e){p.readOut.clear();p.readIn.clear();scheduleSync(a,p,5);}
+            });
+        }catch(ApiError e){
+            if(e.code==401){scheduleSync(a,p,30);return;}
+            scheduleSync(a,p,Math.min(30,4L*(++p.failures)));
+        }catch(Exception e){
+            if(p.active)ConnectionsManager.onToxicgramConnectionStateChanged(ApplicationLoader.isNetworkOnline()?ConnectionsManager.ConnectionStateConnecting:ConnectionsManager.ConnectionStateWaitingForNetwork,a);
+            scheduleSync(a,p,Math.min(30,4L*(++p.failures)));
+        }
     }
     private static final String KEY="toxicgram_original_session";
     private ToxicgramRpc(){}
@@ -109,6 +203,7 @@ public final class ToxicgramRpc {
         u.phone=p.optString("phone","").replace("+","");u.username=p.optString("username","");
         u.self=self;u.flags=2|4|16|(u.username.isEmpty()?0:8)|(self?1024:0);
         u.access_hash=u.id;u.flags|=1;
+        if(p.has("last_seen")){u.status=presence(p);u.flags|=64;}
         return u;
     }
     private static String canonical(long id) throws ApiError {
@@ -461,10 +556,10 @@ public final class ToxicgramRpc {
             JSONObject profile=http("GET","/v1/me",null,t);
             TLRPC.TL_auth_authorization auth=new TLRPC.TL_auth_authorization();
             auth.user=user(profile,true);
-            store(a,t,profile.getString("number"));ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);return auth;
+            store(a,t,profile.getString("number"));setForeground(a,true);ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);return auth;
         }
         if(req instanceof TLRPC.TL_auth_logOut){
-            http("POST","/v1/auth/logout",null,token(a));prefs(a).edit().clear().commit();
+            http("POST","/v1/auth/logout",null,token(a));setForeground(a,false);prefs(a).edit().clear().commit();
             return new TLRPC.TL_auth_loggedOut();
         }
         if(req instanceof TLRPC.TL_messages_getDialogs){
