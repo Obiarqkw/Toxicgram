@@ -93,6 +93,29 @@ public final class ToxicgramRpc {
         u.access_hash=u.id;u.flags|=1;
         return u;
     }
+    private static String canonical(long id) throws ApiError {
+        if(id<100000000L||id>=200000000L)throw new ApiError(400,"PEER_ID_INVALID");
+        String digits=String.format(Locale.US,"%08d",id-100000000L);
+        return "TG-"+digits.substring(0,4)+"-"+digits.substring(4);
+    }
+    private static String peer(int a,TLRPC.InputPeer input)throws ApiError{
+        if(input instanceof TLRPC.TL_inputPeerSelf)return prefs(a).getString("number","");
+        if(input instanceof TLRPC.TL_inputPeerUser)return canonical(input.user_id);
+        throw new ApiError(501,"TOXICGRAM_PEER_TYPE_NOT_IMPLEMENTED");
+    }
+    private static TLRPC.TL_peerUser peerObject(String number){
+        TLRPC.TL_peerUser p=new TLRPC.TL_peerUser();p.user_id=userId(number);return p;
+    }
+    private static TLRPC.TL_message message(JSONObject data,String self)throws Exception{
+        TLRPC.TL_message m=new TLRPC.TL_message();
+        m.id=Math.toIntExact(data.getLong("id"));m.date=data.getInt("created");
+        m.message=data.optString("text","");m.out=self.equals(data.optString("sender"));
+        String other=m.out?data.getString("recipient"):data.getString("sender");
+        m.peer_id=peerObject(other);m.from_id=peerObject(data.getString("sender"));
+        m.flags=256|(m.out?2:0);m.media=new TLRPC.TL_messageMediaEmpty();
+        if(data.optLong("edited")>0){m.edit_date=data.getInt("edited");m.flags|=32768;}
+        return m;
+    }
     public static void send(int account,TLObject request,RequestDelegate completion,RequestDelegateTimestamp timestamp){
         IO.execute(()->{
             TLObject response=null;TLRPC.TL_error error=null;
@@ -131,6 +154,56 @@ public final class ToxicgramRpc {
         if(req instanceof TLRPC.TL_auth_logOut){
             http("POST","/v1/auth/logout",null,token(a));prefs(a).edit().clear().commit();
             return new TLRPC.TL_auth_loggedOut();
+        }
+        if(req instanceof TLRPC.TL_messages_getDialogs){
+            TLRPC.TL_messages_getDialogs query=(TLRPC.TL_messages_getDialogs)req;
+            TLRPC.TL_messages_dialogs result=new TLRPC.TL_messages_dialogs();
+            if(query.offset_id!=0)return result;
+            String t=token(a),self=prefs(a).getString("number","");
+            JSONArray chats=http("GET","/v1/chats",null,t).getJSONArray("chats");
+            for(int i=0;i<chats.length();i++){
+                JSONObject row=chats.getJSONObject(i);String number=row.getString("number");
+                boolean isSelf=self.equals(number);
+                TLRPC.TL_user u=user(row,isSelf);result.users.add(u);
+                TLRPC.TL_dialog dialog=new TLRPC.TL_dialog();
+                dialog.peer=peerObject(number);dialog.top_message=Math.toIntExact(row.getLong("id"));
+                dialog.unread_count=row.optInt("unread");dialog.notify_settings=new TLRPC.TL_peerNotifySettings();
+                dialog.pinned=row.optInt("pinned")!=0;if(dialog.pinned)dialog.flags|=4;
+                result.dialogs.add(dialog);
+                // Fetch actual latest message rather than infer its sender from the dialog.
+                JSONArray history=http("GET","/v1/chats/"+number+"/messages",null,t).getJSONArray("messages");
+                if(history.length()>0)result.messages.add(message(history.getJSONObject(history.length()-1),self));
+            }
+            return result;
+        }
+        if(req instanceof TLRPC.TL_messages_getHistory){
+            TLRPC.TL_messages_getHistory query=(TLRPC.TL_messages_getHistory)req;
+            String other=peer(a,query.peer),t=token(a),self=prefs(a).getString("number","");
+            String path="/v1/chats/"+other+"/messages"+(query.offset_id>0?"?before="+query.offset_id:"");
+            JSONArray messages=http("GET",path,null,t).getJSONArray("messages");
+            TLRPC.TL_messages_messages result=new TLRPC.TL_messages_messages();
+            for(int i=messages.length()-1;i>=0;i--)result.messages.add(message(messages.getJSONObject(i),self));
+            if(!other.equals(self))result.users.add(user(http("GET","/v1/users/"+other,null,t),false));
+            return result;
+        }
+        if(req instanceof TLRPC.TL_messages_sendMessage){
+            TLRPC.TL_messages_sendMessage send=(TLRPC.TL_messages_sendMessage)req;
+            JSONObject sent=http("POST","/v1/messages",new JSONObject().put("recipient",peer(a,send.peer)).put("text",send.message),token(a));
+            TLRPC.TL_updateShortSentMessage result=new TLRPC.TL_updateShortSentMessage();
+            result.id=Math.toIntExact(sent.getLong("id"));result.date=sent.getInt("created");result.out=true;result.flags=2;
+            // REST has no global MTProto pts stream. This response acknowledges the persisted message.
+            result.pts=0;result.pts_count=0;return result;
+        }
+        if(req instanceof TLRPC.TL_messages_readHistory){
+            TLRPC.TL_messages_readHistory read=(TLRPC.TL_messages_readHistory)req;
+            http("PUT","/v1/chats/"+peer(a,read.peer)+"/read",new JSONObject().put("last_id",Math.max(0,read.max_id)),token(a));
+            TLRPC.TL_messages_affectedMessages result=new TLRPC.TL_messages_affectedMessages();result.pts=0;result.pts_count=0;return result;
+        }
+        if(req instanceof TLRPC.TL_contacts_resolveUsername || req instanceof TLRPC.TL_contacts_resolvePhone){
+            String value=req instanceof TLRPC.TL_contacts_resolveUsername?"@"+((TLRPC.TL_contacts_resolveUsername)req).username:phone(((TLRPC.TL_contacts_resolvePhone)req).phone);
+            JSONObject profile=http("GET","/v1/users/"+android.net.Uri.encode(value),null,token(a));
+            TLRPC.TL_contacts_resolvedPeer result=new TLRPC.TL_contacts_resolvedPeer();
+            result.peer=peerObject(profile.getString("number"));result.users.add(user(profile,prefs(a).getString("number","").equals(profile.getString("number"))));return result;
         }
         // All unported methods fail closed. No native MTProto or official Telegram RPC fallback.
         throw new ApiError(501,"TOXICGRAM_METHOD_NOT_IMPLEMENTED");
