@@ -1,6 +1,13 @@
 package com.toxicgram.app;
 
 import android.app.Activity;
+import android.content.Intent;
+import android.net.Uri;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.provider.OpenableColumns;
+import android.database.Cursor;
+import android.util.LruCache;
 import android.os.Bundle;
 import android.graphics.Color;
 import android.graphics.Canvas;
@@ -52,6 +59,12 @@ public class MainActivity extends Activity {
     private String ownName="", ownPhone="";
     private final java.util.Map<String,String> phones=new java.util.HashMap<>();
     private boolean foreground=true;
+    private String pendingPeer="",pendingName="",pendingMedia="",pendingFilename="",pendingToken="";
+    private int pendingPage=-1;
+    private Runnable pendingRefresh;
+    private final java.util.Map<String,String> avatarIds=new java.util.HashMap<>();
+    private final LruCache<String,Bitmap> imageCache=new LruCache<String,Bitmap>(8*1024*1024){protected int sizeOf(String k,Bitmap b){return b.getByteCount();}};
+    private final ExecutorService mediaNetwork=Executors.newFixedThreadPool(2);
     private final ExecutorService network=Executors.newSingleThreadExecutor();
     private String session, account;
     private LinearLayout root;
@@ -250,23 +263,23 @@ public class MainActivity extends Activity {
             if(!validIdentity(id)){e.setError("Неверный формат");return;}
             TextView error=new TextView(this);
             final int current=page;final String token=session;dialog.getButton(-1).setEnabled(false);
-            network.execute(()->{try{JSONObject d=request("GET","/v1/users/"+id,null,token);runOnUiThread(()->{if(page!=current||isDestroyed()||!dialog.isShowing())return;dialog.dismiss();hideKeyboard();String canonical=d.optString("number",id);phones.put(canonical,d.optString("phone",canonical));showChat(canonical,d.optString("name",canonical));});}catch(Exception ex){runOnUiThread(()->{if(page!=current||isDestroyed()||!dialog.isShowing())return;dialog.getButton(-1).setEnabled(true);e.setError(ex instanceof ApiError&&((ApiError)ex).status==404?"Пользователь не найден":"Не удалось подключиться");});}});
+            network.execute(()->{try{JSONObject d=request("GET","/v1/users/"+id,null,token);runOnUiThread(()->{if(page!=current||isDestroyed()||!dialog.isShowing())return;dialog.dismiss();hideKeyboard();String canonical=d.optString("number",id);phones.put(canonical,d.optString("phone",canonical));avatarIds.put(canonical,d.optString("avatar",""));showChat(canonical,d.optString("name",canonical));});}catch(Exception ex){runOnUiThread(()->{if(page!=current||isDestroyed()||!dialog.isShowing())return;dialog.getButton(-1).setEnabled(true);e.setError(ex instanceof ApiError&&((ApiError)ex).status==404?"Пользователь не найден":"Не удалось подключиться");});}});
         }));dialog.show();
     }
     void drawer(){
         final android.app.Dialog dialog=new android.app.Dialog(this);
         LinearLayout menu=column();menu.setBackgroundColor(BG);
         LinearLayout head=column();head.setBackgroundColor(CARD);head.setPadding(dp(20),dp(24),dp(20),dp(18));
-        head.addView(avatar(ownName.isEmpty()?account:ownName,28),new LinearLayout.LayoutParams(dp(64),dp(64)));
+        head.addView(photoAvatar(ownName.isEmpty()?account:ownName,account,28),new LinearLayout.LayoutParams(dp(64),dp(64)));
         TextView nm=label(ownName.isEmpty()?"Toxicgram":ownName,18,INK,true);nm.setPadding(0,dp(12),0,dp(4));head.addView(nm);head.addView(label(displayNumber(account),14,MUTED,false));head.setOnClickListener(v->{dialog.dismiss();copyId();});menu.addView(head);
-        String[] names={"Мой профиль","Новый чат","Избранное","Архив","Скопировать номер",light?"Тёмная тема":"Светлая тема","Выйти","Группы и каналы"};
-        String[] glyphs={"◉","✎","☆","▣","⧉",light?"☾":"☀","↪","♟"};
+        String[] names={"Мой профиль","Новый чат","Избранное","Архив","Скопировать номер",light?"Тёмная тема":"Светлая тема","Выйти","Группы и каналы","Истории","Подарки и звёзды"};
+        String[] glyphs={"◉","✎","☆","▣","⧉",light?"☾":"☀","↪","♟","◌","★"};
         for(int i=0;i<names.length;i++){
             final int action=i;LinearLayout row=horizontal();row.setPadding(dp(20),0,dp(20),0);row.setBackground(ripple(BG,0));
             TextView g=label(glyphs[i],24,MUTED,false);row.addView(g,new LinearLayout.LayoutParams(dp(46),-2));row.addView(label(names[i],16,INK,true));menu.addView(row,new LinearLayout.LayoutParams(-1,dp(54)));
-            row.setOnClickListener(v->{dialog.dismiss();switch(action){case 0:showProfile();break;case 1:askPeer();break;case 2:showChat(account,"Избранное");break;case 3:showChats(true);break;case 4:copyId();break;case 5:light=!light;getPreferences(MODE_PRIVATE).edit().putBoolean("light",light).apply();palette();showAccount();break;case 6:confirmLogout();break;case 7:showRooms();break;}});
+            row.setOnClickListener(v->{dialog.dismiss();switch(action){case 0:showProfile();break;case 1:askPeer();break;case 2:showChat(account,"Избранное");break;case 3:showChats(true);break;case 4:copyId();break;case 5:light=!light;getPreferences(MODE_PRIVATE).edit().putBoolean("light",light).apply();palette();showAccount();break;case 6:confirmLogout();break;case 7:showRooms();break;case 8:showStories();break;case 9:showGifts();break;}});
         }
-        dialog.setContentView(menu);if(dialog.getWindow()!=null){dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);dialog.getWindow().setGravity(Gravity.LEFT|Gravity.TOP);dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);dialog.getWindow().setDimAmount(.45f);}
+        ScrollView menuScroll=new ScrollView(this);menuScroll.addView(menu);dialog.setContentView(menuScroll);if(dialog.getWindow()!=null){dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);dialog.getWindow().setGravity(Gravity.LEFT|Gravity.TOP);dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);dialog.getWindow().setDimAmount(.45f);}
         dialog.show();if(dialog.getWindow()!=null)dialog.getWindow().setLayout(Math.min(dp(320),(int)(getResources().getDisplayMetrics().widthPixels*.85)), -1);
     }
     void confirmLogout(){
@@ -298,11 +311,11 @@ public class MainActivity extends Activity {
             list.removeAllViews();String q=search.getText().toString().trim().toLowerCase(Locale.ROOT);int visible=0;
             for(int i=0;i<cache[0].length();i++){
                 JSONObject row=cache[0].optJSONObject(i);if(row==null)continue;
-                String id=row.optString("number"),name=id.equals(account)?"Избранное":row.optString("name",id),msg=row.optString("text");phones.put(id,row.optString("phone",id));
+                String id=row.optString("number"),name=id.equals(account)?"Избранное":row.optString("name",id),msg=row.optString("text");phones.put(id,row.optString("phone",id));avatarIds.put(id,row.optString("avatar",""));
                 if((row.optInt("archived")!=0)!=archived)continue;
                 if(!q.isEmpty()&&!(name+" "+displayNumber(id)+" "+id+" "+msg).toLowerCase(Locale.ROOT).contains(q))continue;visible++;
                 LinearLayout cell=horizontal();cell.setBackground(ripple(BG,0));cell.setPadding(dp(12),0,dp(16),0);
-                cell.addView(avatar(name,23),new LinearLayout.LayoutParams(dp(54),dp(54)));
+                cell.addView(photoAvatar(name,id,23),new LinearLayout.LayoutParams(dp(54),dp(54)));
                 LinearLayout content=column();content.setPadding(dp(12),0,0,0);
                 LinearLayout top=horizontal();TextView nm=label(name,16,INK,true);nm.setSingleLine();nm.setEllipsize(TextUtils.TruncateAt.END);top.addView(nm,new LinearLayout.LayoutParams(0,-2,1));TextView timestamp=label((row.optInt("pinned")!=0?"◆  ":"")+timeLabel(row.optLong("created")),12,MUTED,false);top.addView(timestamp);
                 content.addView(top);LinearLayout lower=horizontal();TextView preview=label(msg,14,MUTED,false);preview.setSingleLine();preview.setEllipsize(TextUtils.TruncateAt.END);preview.setPadding(0,dp(4),0,0);lower.addView(preview,new LinearLayout.LayoutParams(0,-2,1));int unread=row.optInt("unread");if(unread>0){TextView badge=label(unread>99?"99+":String.valueOf(unread),12,Color.WHITE,true);badge.setGravity(Gravity.CENTER);badge.setPadding(dp(7),dp(3),dp(7),dp(3));badge.setBackground(shape(PURPLE,20));lower.addView(badge);}content.addView(lower);
@@ -312,24 +325,24 @@ public class MainActivity extends Activity {
         };
         search.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int a,int n,int f){}public void onTextChanged(CharSequence s,int a,int b,int n){render.run();}public void afterTextChanged(Editable e){}});
         Runnable load=()->{if(loading[0])return;loading[0]=true;String token=session;network.execute(()->{try{JSONObject d=request("GET","/v1/chats",null,token);runOnUiThread(()->{loading[0]=false;if(isDestroyed()||page!=current)return;info.setText("");JSONArray arr=d.optJSONArray("chats");if(arr!=null){String value=arr.toString();if(!value.equals(snapshot[0])){snapshot[0]=value;cache[0]=arr;render.run();}}});}catch(Exception e){runOnUiThread(()->{loading[0]=false;if(isDestroyed()||page!=current)return;if(e instanceof ApiError&&((ApiError)e).status==401){session=null;account=null;showLogin();return;}info.setText("Подключение…");});}});};
-        call("GET","/v1/profile",null,d->{ownName=d.optString("name",account);ownPhone=d.optString("phone",account);phones.put(account,ownPhone);},null,null);
+        call("GET","/v1/profile",null,d->{ownName=d.optString("name",account);ownPhone=d.optString("phone",account);phones.put(account,ownPhone);avatarIds.put(account,d.optString("avatar",""));},null,null);
         render.run();load.run();timer.postDelayed(new Runnable(){public void run(){if(isDestroyed()||page!=current)return;if(foreground)load.run();timer.postDelayed(this,5000);}},5000);
     }
     void showProfile(){
         LinearLayout layout=pageLayout();LinearLayout bar=toolbar(layout,"Профиль",null,()->showAccount());line(layout,0);
         LinearLayout main=column();main.setPadding(dp(22),dp(32),dp(22),dp(20));main.setGravity(Gravity.CENTER_HORIZONTAL);ScrollView profileScroll=new ScrollView(this);profileScroll.addView(main,new ScrollView.LayoutParams(-1,-2));layout.addView(profileScroll,new LinearLayout.LayoutParams(-1,0,1));
-        TextView photo=avatar(ownName.isEmpty()?account:ownName,42);main.addView(photo,new LinearLayout.LayoutParams(dp(100),dp(100)));
+        FrameLayout photo=photoAvatar(ownName.isEmpty()?account:ownName,account,42);main.addView(photo,new LinearLayout.LayoutParams(dp(100),dp(100)));photo.setOnClickListener(v->pickAvatar());
         TextView title=label(ownName.isEmpty()?account:ownName,23,INK,true);title.setPadding(0,dp(16),0,dp(8));main.addView(title);
-        TextView id=label(displayNumber(account),16,PURPLE,false);id.setOnClickListener(v->copyId());main.addView(id);
+        TextView id=label(displayNumber(account),16,PURPLE,false);id.setOnClickListener(v->copyId());main.addView(id);TextView changePhoto=label("Изменить фото",15,PURPLE,true);changePhoto.setPadding(0,dp(12),0,0);main.addView(changePhoto);changePhoto.setOnClickListener(v->pickAvatar());
         root=main;TextView hint=text("Имя пользователя",13,MUTED,false,8);hint.setPadding(0,dp(30),0,0);
         EditText name=field("Имя",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,64);name.setText(ownName);EditText username=field("@username",InputType.TYPE_CLASS_TEXT,32);EditText bio=field("О себе",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,160);TextView info=text("",14,MUTED,false,8);
-        Button save=button("Сохранить");call("GET","/v1/profile",null,d->{name.setText(d.getString("name"));username.setText(d.optString("username"));bio.setText(d.optString("bio"));phones.put(account,d.optString("phone",account));id.setText(displayNumber(account));},info,save);
+        Button save=button("Сохранить");call("GET","/v1/profile",null,d->{name.setText(d.getString("name"));username.setText(d.optString("username"));bio.setText(d.optString("bio"));phones.put(account,d.optString("phone",account));id.setText(displayNumber(account));avatarIds.put(account,d.optString("avatar",""));},info,save);
         save.setOnClickListener(v->{String value=name.getText().toString().trim();if(value.isEmpty()){name.setError("Введите имя");return;}String u=username.getText().toString().trim().replaceFirst("^@","");if(!u.isEmpty()&&!u.matches("[A-Za-z0-9_]{5,32}")){username.setError("От 5 до 32 латинских букв, цифр или _");return;}JSONObject payload=data("name",value);try{payload.put("username",u);payload.put("bio",bio.getText().toString().trim());}catch(Exception ignored){}call("PUT","/v1/profile",payload,d->{ownName=d.optString("name",value);hideKeyboard();showAccount();},info,save);});
     }
     void showChat(String peer,String name){
         LinearLayout layout=pageLayout();final int current=page;
         LinearLayout bar=horizontal();bar.addView(icon("back","Назад",()->{hideKeyboard();showAccount();}),new LinearLayout.LayoutParams(dp(48),dp(56)));
-        bar.addView(avatar(name,19),new LinearLayout.LayoutParams(dp(40),dp(40)));
+        bar.addView(photoAvatar(name,peer,19),new LinearLayout.LayoutParams(dp(40),dp(40)));
         LinearLayout titles=column();titles.setPadding(dp(12),0,0,0);TextView heading=label(name,18,INK,true);heading.setSingleLine();heading.setEllipsize(TextUtils.TruncateAt.END);titles.addView(heading);titles.addView(label(displayNumber(peer),12,MUTED,false));bar.addView(titles,new LinearLayout.LayoutParams(0,-2,1));
         ImageButton more=icon("more","Меню чата",()->{});more.setOnClickListener(v->{PopupMenu popup=new PopupMenu(this,more);popup.getMenu().add("Скопировать номер");if(!peer.equals(account)){popup.getMenu().add("Заблокировать");popup.getMenu().add("Разблокировать");}popup.setOnMenuItemClickListener(item->{if(!item.getTitle().equals("Скопировать номер")){boolean block=item.getTitle().equals("Заблокировать");JSONObject data=new JSONObject();try{data.put("blocked",block);}catch(Exception ignored){}call("PUT","/v1/users/"+peer+"/block",data,x->notice(block?"Пользователь заблокирован":"Пользователь разблокирован"),null,null);return true;}((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Toxicgram ID",displayNumber(peer)));notice("Номер скопирован");return true;});popup.show();});bar.addView(more,new LinearLayout.LayoutParams(dp(48),dp(56)));layout.addView(bar,new LinearLayout.LayoutParams(-1,dp(56)));line(layout,0);
         FrameLayout backdrop=new FrameLayout(this);backdrop.setBackgroundColor(CHAT);layout.addView(backdrop,new LinearLayout.LayoutParams(-1,0,1));
@@ -337,6 +350,7 @@ public class MainActivity extends Activity {
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout history=column();history.setPadding(dp(10),dp(12),dp(10),dp(12));history.setGravity(Gravity.BOTTOM);scroll.addView(history,new ScrollView.LayoutParams(-1,-2));backdrop.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
         TextView info=label("",12,MUTED,false);info.setGravity(Gravity.CENTER);layout.addView(info);
         LinearLayout composerRow=horizontal();composerRow.setPadding(dp(8),dp(6),dp(8),dp(6));composerRow.setBackgroundColor(BG);
+        ImageButton attach=icon("edit","Прикрепить файл",()->pickAttachment(peer,name));composerRow.addView(attach,new LinearLayout.LayoutParams(dp(40),dp(46)));
         EditText composer=new EditText(this);composer.setTextColor(INK);composer.setHintTextColor(MUTED);composer.setHint("Сообщение");composer.setTextSize(16);composer.setMinLines(1);composer.setMaxLines(4);composer.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_MULTI_LINE|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);composer.setFilters(new InputFilter[]{new InputFilter.LengthFilter(4000)});composer.setPadding(dp(15),dp(12),dp(15),dp(12));composer.setBackground(shape(CARD,24));composerRow.addView(composer,new LinearLayout.LayoutParams(0,-2,1));
         ImageButton send=circleAction("send","Отправить сообщение",()->{});LinearLayout.LayoutParams sp=new LinearLayout.LayoutParams(dp(46),dp(46));sp.leftMargin=dp(6);composerRow.addView(send,sp);layout.addView(composerRow,new LinearLayout.LayoutParams(-1,-2));
         final long[] last={-1};final String[] signature={""};final boolean[] loading={false};
@@ -347,13 +361,91 @@ public class MainActivity extends Activity {
                 JSONObject msg=arr.optJSONObject(i);if(msg==null)continue;boolean mine=account.equals(msg.optString("sender"));long created=msg.optLong("created");String day=DateFormat.format("dd MMMM yyyy",new Date(created*1000L)).toString();
                 if(!day.equals(previousDay)){TextView date=label(day,12,Color.WHITE,true);date.setGravity(Gravity.CENTER);date.setPadding(dp(12),dp(5),dp(12),dp(5));date.setBackground(shape(0xff64758a,16));LinearLayout.LayoutParams datep=new LinearLayout.LayoutParams(-2,-2);datep.gravity=Gravity.CENTER;datep.setMargins(0,dp(8),0,dp(12));history.addView(date,datep);previousDay=day;}
                 LinearLayout bubble=column();bubble.setPadding(dp(12),dp(8),dp(10),dp(6));GradientDrawable bg=new GradientDrawable();bg.setColor(mine?OUT:CARD);float rad=dp(16),tail=dp(4);bg.setCornerRadii(mine?new float[]{rad,rad,rad,rad,tail,tail,rad,rad}:new float[]{rad,rad,rad,rad,rad,rad,tail,tail});bubble.setBackground(bg);
-                TextView body=label(msg.optString("text"),16,INK,false);body.setMaxWidth(Math.min(dp(310),(int)(getResources().getDisplayMetrics().widthPixels*.76)));body.setTextIsSelectable(false);bubble.addView(body,new LinearLayout.LayoutParams(-2,-2));JSONArray reactions=msg.optJSONArray("reactions");if(reactions!=null&&reactions.length()>0){StringBuilder emojis=new StringBuilder();for(int ri=0;ri<reactions.length();ri++){JSONObject rx=reactions.optJSONObject(ri);if(rx!=null)emojis.append(rx.optString("emoji")).append(" ").append(rx.optInt("count")).append("  ");}TextView reaction=label(emojis.toString().trim(),14,PURPLE,true);bubble.addView(reaction);}
+                JSONObject attachment=msg.optJSONObject("attachment");TextView body=label(msg.optString("text"),16,INK,false);body.setMaxWidth(Math.min(dp(310),(int)(getResources().getDisplayMetrics().widthPixels*.76)));body.setTextIsSelectable(false);bubble.addView(body,new LinearLayout.LayoutParams(-2,-2));if(attachment!=null){String aid=attachment.optString("id"),filename=attachment.optString("name","file"),mime=attachment.optString("mime");if(mime.startsWith("image/")){ImageView preview=new ImageView(this);preview.setScaleType(ImageView.ScaleType.CENTER_CROP);preview.setBackground(shape(CHAT,10));bubble.addView(preview,new LinearLayout.LayoutParams(dp(220),dp(150)));loadImage(aid,preview,512);preview.setOnClickListener(v->saveAttachment(aid,filename,mime));}TextView download=label("↓  Сохранить файл · "+(attachment.optLong("size")/1024)+" КБ",13,PURPLE,true);download.setPadding(0,dp(8),0,dp(5));bubble.addView(download);download.setOnClickListener(v->saveAttachment(aid,filename,mime));}JSONArray reactions=msg.optJSONArray("reactions");if(reactions!=null&&reactions.length()>0){StringBuilder emojis=new StringBuilder();for(int ri=0;ri<reactions.length();ri++){JSONObject rx=reactions.optJSONObject(ri);if(rx!=null)emojis.append(rx.optString("emoji")).append(" ").append(rx.optInt("count")).append("  ");}TextView reaction=label(emojis.toString().trim(),14,PURPLE,true);bubble.addView(reaction);}
                 TextView stamp=label((msg.optLong("edited")>0?"изм. ":"")+DateFormat.format("HH:mm",new Date(created*1000L)).toString()+(mine?(msg.optBoolean("read")?"  ✓✓":"  ✓"):""),11,mine?PURPLE:MUTED,false);stamp.setGravity(Gravity.RIGHT);LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(-1,-2);tp.topMargin=dp(3);bubble.addView(stamp,tp);LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-2,-2);bp.gravity=mine?Gravity.RIGHT:Gravity.LEFT;bp.bottomMargin=dp(5);history.addView(bubble,bp);View.OnLongClickListener actions=v->{messageActions(msg,mine,peer,name,info);return true;};bubble.setOnLongClickListener(actions);body.setOnLongClickListener(actions);
             }
             if(bottom)scroll.post(()->scroll.fullScroll(View.FOCUS_DOWN));
         });}catch(Exception e){runOnUiThread(()->{loading[0]=false;if(isDestroyed()||page!=current)return;if(e instanceof ApiError&&((ApiError)e).status==401){session=null;account=null;showLogin();return;}info.setText("Подключение…");});}});};
         send.setOnClickListener(v->{String value=composer.getText().toString().trim();if(value.isEmpty())return;send.setEnabled(false);JSONObject body=data("recipient",peer);try{body.put("text",value);}catch(Exception ignored){}String token=session;network.execute(()->{try{request("POST","/v1/messages",body,token);runOnUiThread(()->{if(isDestroyed()||page!=current)return;send.setEnabled(true);if(composer.getText().toString().trim().equals(value))composer.setText("");load.run();});}catch(Exception e){runOnUiThread(()->{if(isDestroyed()||page!=current)return;send.setEnabled(true);info.setText("Сообщение не отправлено. Повторите попытку.");});}});});
         load.run();timer.postDelayed(new Runnable(){public void run(){if(isDestroyed()||page!=current)return;if(foreground)load.run();timer.postDelayed(this,5000);}},5000);
+    }
+    FrameLayout photoAvatar(String name,String id,int size){
+        FrameLayout frame=new FrameLayout(this);
+        frame.addView(avatar(name,size),new FrameLayout.LayoutParams(-1,-1));
+        String aid=avatarIds.get(id);if(aid!=null&&!aid.isEmpty()){
+            ImageView photo=new ImageView(this);photo.setBackground(shape(CARD,100));photo.setClipToOutline(true);photo.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            frame.addView(photo,new FrameLayout.LayoutParams(-1,-1));loadImage(aid,photo,256);
+        }return frame;
+    }
+    byte[] readBytes(InputStream in,int max)throws IOException{
+        try(InputStream stream=in;ByteArrayOutputStream out=new ByteArrayOutputStream()){
+            if(stream==null)throw new IOException("No file");byte[] b=new byte[8192];int n;while((n=stream.read(b))!=-1){if(out.size()+n>max)throw new IOException("File too large");out.write(b,0,n);}return out.toByteArray();
+        }
+    }
+    byte[] binary(String method,String path,byte[] body,String token)throws Exception{
+        HttpsURLConnection conn=(HttpsURLConnection)new URL(BASE+path).openConnection();
+        try{conn.setConnectTimeout(15000);conn.setReadTimeout(30000);conn.setRequestMethod(method);conn.setInstanceFollowRedirects(false);conn.setRequestProperty("Authorization","Bearer "+token);
+            if(body!=null){conn.setDoOutput(true);conn.setFixedLengthStreamingMode(body.length);conn.setRequestProperty("Content-Type","application/octet-stream");try(OutputStream o=conn.getOutputStream()){o.write(body);}}
+            int code=conn.getResponseCode();if(code<200||code>=300)throw new ApiError(code);return readBytes(conn.getInputStream(),8*1024*1024);
+        }finally{conn.disconnect();}
+    }
+    Bitmap decode(byte[] raw,int max){
+        BitmapFactory.Options options=new BitmapFactory.Options();options.inJustDecodeBounds=true;BitmapFactory.decodeByteArray(raw,0,raw.length,options);if(options.outWidth<=0||options.outHeight<=0)return null;
+        options.inSampleSize=1;while(Math.max(options.outWidth,options.outHeight)/options.inSampleSize>max*2)options.inSampleSize*=2;
+        options.inJustDecodeBounds=false;return BitmapFactory.decodeByteArray(raw,0,raw.length,options);
+    }
+    void loadImage(String aid,ImageView view,int max){
+        if(aid.isEmpty()||session==null)return;String key=aid+":"+max;Bitmap cached=imageCache.get(key);if(cached!=null){view.setImageBitmap(cached);return;}
+        String token=session;mediaNetwork.execute(()->{try{Bitmap b=decode(binary("GET","/v1/media/"+aid,null,token),max);if(b!=null){imageCache.put(key,b);runOnUiThread(()->{if(!isDestroyed()&&token.equals(session))view.setImageBitmap(b);});}}catch(Exception ignored){}});
+    }
+    void pickAvatar(){
+        pendingPage=page;pendingToken=session;
+        Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);intent.setType("image/*");intent.addCategory(Intent.CATEGORY_OPENABLE);
+        try{startActivityForResult(intent,601);}catch(Exception e){notice("Нет приложения для выбора файла");}
+    }
+    void pickAttachment(String peer,String name){
+        pendingPeer=peer;pendingName=name;pendingPage=page;pendingToken=session;
+        Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);intent.setType("*/*");intent.addCategory(Intent.CATEGORY_OPENABLE);
+        try{startActivityForResult(intent,602);}catch(Exception e){notice("Нет приложения для выбора файла");}
+    }
+    void saveAttachment(String aid,String filename,String mime){
+        pendingMedia=aid;pendingFilename=filename;pendingPage=page;pendingToken=session;
+        Intent intent=new Intent(Intent.ACTION_CREATE_DOCUMENT);intent.setType(mime.isEmpty()?"application/octet-stream":mime);intent.addCategory(Intent.CATEGORY_OPENABLE);intent.putExtra(Intent.EXTRA_TITLE,filename);
+        try{startActivityForResult(intent,603);}catch(Exception e){notice("Нет приложения для сохранения файла");}
+    }
+    String filename(Uri uri){
+        try(Cursor cursor=getContentResolver().query(uri,new String[]{OpenableColumns.DISPLAY_NAME},null,null,null)){if(cursor!=null&&cursor.moveToFirst()){String value=cursor.getString(0);if(value!=null)return value;}}catch(Exception ignored){}
+        return "file";
+    }
+    @Override protected void onActivityResult(int code,int result,Intent intent){
+        super.onActivityResult(code,result,intent);
+        if(result!=RESULT_OK||intent==null||intent.getData()==null||code<601||code>603)return;
+        final Uri uri=intent.getData();final int current=pendingPage;final String token=pendingToken,peer=pendingPeer,name=pendingName,aid=pendingMedia;
+        if(token==null||!token.equals(session)||page!=current)return;
+        notice(code==603?"Загрузка…":"Отправка…");
+        mediaNetwork.execute(()->{try{
+            if(code==603){byte[] raw=binary("GET","/v1/media/"+aid,null,token);try(OutputStream out=getContentResolver().openOutputStream(uri,"w")){if(out==null)throw new IOException("No output");out.write(raw);}}
+            else if(code==601){Bitmap b=decode(readBytes(getContentResolver().openInputStream(uri),8*1024*1024),512);if(b==null)throw new IOException("Invalid photo");int w=b.getWidth(),h=b.getHeight(),size=Math.min(w,h);Bitmap crop=Bitmap.createBitmap(b,(w-size)/2,(h-size)/2,size,size);Bitmap resized=Bitmap.createScaledBitmap(crop,384,384,true);ByteArrayOutputStream bytes=new ByteArrayOutputStream();resized.compress(Bitmap.CompressFormat.JPEG,80,bytes);JSONObject response=new JSONObject(new String(binary("PUT","/v1/avatar",bytes.toByteArray(),token),StandardCharsets.UTF_8));String newId=response.getString("avatar");runOnUiThread(()->{if(!isDestroyed()&&page==current&&token.equals(session)){avatarIds.put(account,newId);showProfile();}});}
+            else{byte[] raw=readBytes(getContentResolver().openInputStream(uri),8*1024*1024);String mime=getContentResolver().getType(uri);String path="/v1/attachments?recipient="+Uri.encode(peer)+"&name="+Uri.encode(filename(uri))+"&mime="+Uri.encode(mime==null?"application/octet-stream":mime);binary("POST",path,raw,token);runOnUiThread(()->{if(!isDestroyed()&&page==current&&token.equals(session))showChat(peer,name);});}
+            runOnUiThread(()->{if(!isDestroyed()&&token.equals(session))notice(code==603?"Файл сохранён":"Готово");});
+        }catch(Exception e){runOnUiThread(()->{if(!isDestroyed()&&token.equals(session))notice("Не удалось выполнить операцию. Лимит файла — 8 МБ.");});}});
+    }
+    void showStories(){
+        LinearLayout layout=pageLayout();LinearLayout bar=toolbar(layout,"Истории",null,()->showAccount());line(layout,0);TextView info=label("",13,MUTED,false);layout.addView(info);
+        bar.addView(icon("edit","Новая история",()->{EditText input=new EditText(this);input.setHint("Что нового?");input.setFilters(new InputFilter[]{new InputFilter.LengthFilter(280)});new android.app.AlertDialog.Builder(this).setTitle("История на 24 часа").setMessage("Видна пользователям, с которыми вы переписывались.").setView(input).setNegativeButton("Отмена",null).setPositiveButton("Опубликовать",(d,w)->{String v=input.getText().toString().trim();if(!v.isEmpty())call("POST","/v1/stories",data("text",v),x->showStories(),info,null);}).show();}),new LinearLayout.LayoutParams(dp(48),dp(56)));
+        ScrollView scroll=new ScrollView(this);LinearLayout list=column();scroll.addView(list);layout.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+        call("GET","/v1/stories",null,d->{JSONArray arr=d.getJSONArray("stories");if(arr.length()==0){TextView empty=label("Нет новых историй",17,MUTED,false);empty.setGravity(Gravity.CENTER);empty.setPadding(0,dp(40),0,0);list.addView(empty);}
+            for(int j=0;j<arr.length();j++){JSONObject story=arr.getJSONObject(j);LinearLayout card=column();card.setPadding(dp(18),dp(14),dp(18),dp(14));card.setBackground(shape(CARD,18));TextView author=label(story.optString("name"),15,PURPLE,true);card.addView(author);TextView text=label(story.optString("text"),22,INK,false);text.setPadding(0,dp(12),0,dp(12));card.addView(text);card.addView(label(timeLabel(story.optLong("created")),12,MUTED,false));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(dp(12),dp(8),dp(12),dp(4));list.addView(card,p);if(account.equals(story.optString("owner")))card.setOnLongClickListener(v->{new android.app.AlertDialog.Builder(this).setTitle("Удалить историю?").setNegativeButton("Отмена",null).setPositiveButton("Удалить",(a,b)->call("DELETE","/v1/stories/"+story.optLong("id"),null,x->showStories(),info,null)).show();return true;});}
+        },info,null);
+    }
+    void showGifts(){
+        LinearLayout layout=pageLayout();toolbar(layout,"Подарки и звёзды",null,()->showAccount());line(layout,0);
+        ScrollView sc=new ScrollView(this);LinearLayout list=column();list.setPadding(dp(14),dp(14),dp(14),dp(14));sc.addView(list);layout.addView(sc,new LinearLayout.LayoutParams(-1,0,1));TextView info=label("",13,MUTED,false);list.addView(info);
+        call("GET","/v1/gifts",null,d->{TextView balance=label("★ "+d.optInt("balance"),34,PURPLE,true);balance.setGravity(Gravity.CENTER);list.addView(balance);TextView note=label("Внутренние звёзды · без денежной стоимости",13,MUTED,false);note.setGravity(Gravity.CENTER);list.addView(note);JSONArray catalog=d.getJSONArray("catalog"),received=d.getJSONArray("received");
+            TextView head=label("Отправить подарок",19,INK,true);head.setPadding(0,dp(24),0,dp(8));list.addView(head);
+            java.util.Map<String,String> names=new java.util.HashMap<>();for(int j=0;j<catalog.length();j++){JSONObject item=catalog.getJSONObject(j);String kind=item.getString("kind"),title=item.getString("emoji")+"  "+item.getString("name");int price=item.getInt("price");names.put(kind,title);TextView card=label(title+"   ·   ★ "+price,19,INK,true);card.setPadding(dp(16),dp(18),dp(16),dp(18));card.setBackground(ripple(CARD,14));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.bottomMargin=dp(8);list.addView(card,p);card.setOnClickListener(v->{EditText target=new EditText(this);target.setHint("Номер или @username");target.setSingleLine();new android.app.AlertDialog.Builder(this).setTitle(title).setMessage("Отправить за "+price+" внутренних звёзд?").setView(target).setNegativeButton("Отмена",null).setPositiveButton("Отправить",(a,b)->{String id=identity(target.getText().toString());if(!validIdentity(id)){notice("Неверный номер");return;}JSONObject body=data("recipient",id);try{body.put("kind",kind);}catch(Exception ignored){}call("POST","/v1/gifts",body,x->showGifts(),info,null);}).show();});}
+            TextView own=label("Моя коллекция",19,INK,true);own.setPadding(0,dp(20),0,dp(12));list.addView(own);if(received.length()==0)list.addView(label("Пока нет подарков",14,MUTED,false));for(int j=0;j<received.length();j++){JSONObject item=received.getJSONObject(j);TextView card=label(names.getOrDefault(item.optString("kind"),item.optString("kind"))+"\n#"+item.optString("serial"),16,INK,false);card.setBackground(shape(CARD,14));card.setPadding(dp(14),dp(12),dp(14),dp(12));list.addView(card);}
+        },info,null);
     }
     void createRoom(TextView info){
         LinearLayout panel=column();panel.setPadding(dp(20),dp(8),dp(20),dp(8));
@@ -389,7 +481,7 @@ public class MainActivity extends Activity {
     }
     void messageActions(JSONObject msg,boolean mine,String peer,String name,TextView info){
         long id=msg.optLong("id");String value=msg.optString("text");
-        String[] options=mine?new String[]{"Реакция","Копировать","Переслать","В избранное","Изменить","Удалить у себя","Удалить у всех"}:new String[]{"Реакция","Копировать","Переслать","В избранное","Удалить у себя"};
+        String[] options=msg.optJSONObject("attachment")!=null?(mine?new String[]{"Реакция","Удалить у себя","Удалить у всех"}:new String[]{"Реакция","Удалить у себя"}):mine?new String[]{"Реакция","Копировать","Переслать","В избранное","Изменить","Удалить у себя","Удалить у всех"}:new String[]{"Реакция","Копировать","Переслать","В избранное","Удалить у себя"};
         new android.app.AlertDialog.Builder(this).setTitle("Сообщение").setItems(options,(d,i)->{
             String choice=options[i];
             switch(choice){
@@ -420,5 +512,5 @@ public class MainActivity extends Activity {
             }
         }finally{conn.disconnect();}
     }
-    @Override protected void onDestroy(){timer.removeCallbacksAndMessages(null);network.shutdownNow();super.onDestroy();}
+    @Override protected void onDestroy(){timer.removeCallbacksAndMessages(null);network.shutdownNow();mediaNetwork.shutdownNow();super.onDestroy();}
 }
