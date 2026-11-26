@@ -38,6 +38,10 @@ def init():
         CREATE TABLE IF NOT EXISTS profile_details (number TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE, bio TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS reactions (message_id INTEGER NOT NULL, owner TEXT NOT NULL, emoji TEXT NOT NULL, PRIMARY KEY(message_id,owner));
         CREATE TABLE IF NOT EXISTS blocks (owner TEXT NOT NULL, peer TEXT NOT NULL, PRIMARY KEY(owner,peer));
+        CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, kind TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS room_members (room_id TEXT NOT NULL, number TEXT NOT NULL, PRIMARY KEY(room_id,number));
+        CREATE TABLE IF NOT EXISTS room_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS room_history ON room_messages(room_id,id);
         """)
 
 def phone_for(n, prefix=None):
@@ -446,4 +450,88 @@ def block(number:str,body:BlockUpdate,request:Request):
         require_peer(c,peer)
         if body.blocked: c.execute("INSERT OR IGNORE INTO blocks VALUES (?,?)",(n,peer))
         else: c.execute("DELETE FROM blocks WHERE owner=? AND peer=?",(n,peer))
+    return {"ok":True}
+
+class RoomCreate(BaseModel):
+    title: str = Field(min_length=1,max_length=80)
+    kind: str = Field(max_length=10)
+
+class RoomInvite(BaseModel):
+    number: str = Field(max_length=40)
+
+class RoomText(BaseModel):
+    text: str = Field(min_length=1,max_length=4000)
+
+def get_room(c, rid, n):
+    row=c.execute("SELECT r.* FROM rooms r JOIN room_members m ON m.room_id=r.id WHERE r.id=? AND m.number=?",(rid,n)).fetchone()
+    if not row: raise HTTPException(404,"Room not found")
+    return row
+
+@app.post("/v1/rooms")
+def create_room(body:RoomCreate,request:Request):
+    _,n=session(request)
+    if not allow("room_create:"+n): raise HTTPException(429,"Too many requests")
+    title=body.title.strip()
+    if not title or body.kind not in ("group","channel"): raise HTTPException(400,"Invalid room")
+    rid=secrets.token_hex(12)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("INSERT INTO rooms VALUES (?,?,?,?)",(rid,n,title,body.kind))
+        c.execute("INSERT INTO room_members VALUES (?,?)",(rid,n))
+        c.commit()
+    return {"id":rid,"title":title,"kind":body.kind,"owner":n}
+
+@app.get("/v1/rooms")
+def list_rooms(request:Request):
+    _,n=session(request)
+    with db() as c:
+        rows=c.execute("SELECT r.*, (SELECT COUNT(*) FROM room_members x WHERE x.room_id=r.id) AS members FROM rooms r JOIN room_members m ON r.id=m.room_id WHERE m.number=? ORDER BY r.title COLLATE NOCASE LIMIT 100",(n,)).fetchall()
+    return {"rooms":[dict(row) for row in rows]}
+
+@app.post("/v1/rooms/{rid}/invite")
+def invite_room(rid:str,body:RoomInvite,request:Request):
+    _,n=session(request)
+    if not allow("invite:"+n): raise HTTPException(429,"Too many requests")
+    peer=normalize_number(body.number)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=get_room(c,rid,n)
+        if row["owner"]!=n: raise HTTPException(403,"Only owner can invite")
+        require_peer(c,peer)
+        if c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone(): raise HTTPException(403,"Invitation unavailable")
+        c.execute("INSERT OR IGNORE INTO room_members VALUES (?,?)",(rid,peer))
+        c.commit()
+    return {"ok":True}
+
+@app.get("/v1/rooms/{rid}/messages")
+def room_history(rid:str,request:Request):
+    _,n=session(request)
+    with db() as c:
+        get_room(c,rid,n)
+        rows=c.execute("SELECT m.id,m.sender,m.body AS text,m.created,COALESCE(p.name,m.sender) AS name FROM room_messages m LEFT JOIN profiles p ON p.number=m.sender WHERE m.room_id=? ORDER BY m.id DESC LIMIT 100",(rid,)).fetchall()
+    return {"messages":[dict(row) for row in reversed(rows)]}
+
+@app.post("/v1/rooms/{rid}/messages")
+def room_send(rid:str,body:RoomText,request:Request):
+    _,n=session(request)
+    if not allow("send:"+n): raise HTTPException(429,"Too many messages")
+    value=body.text.strip()
+    if not value: raise HTTPException(400,"Empty message")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=get_room(c,rid,n)
+        if row["kind"]=="channel" and row["owner"]!=n: raise HTTPException(403,"Only owner can post")
+        mid=c.execute("INSERT INTO room_messages(room_id,sender,body,created) VALUES (?,?,?,?)",(rid,n,value,int(time.time()))).lastrowid
+        c.commit()
+    return {"id":mid}
+
+@app.delete("/v1/rooms/{rid}/membership")
+def leave_room(rid:str,request:Request):
+    _,n=session(request)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=get_room(c,rid,n)
+        if row["owner"]==n: raise HTTPException(400,"Owner cannot leave")
+        c.execute("DELETE FROM room_members WHERE room_id=? AND number=?",(rid,n))
+        c.commit()
     return {"ok":True}
