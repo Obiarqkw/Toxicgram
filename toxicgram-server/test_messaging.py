@@ -82,5 +82,41 @@ class MessagingTest(unittest.TestCase):
                     self.assertEqual(client.delete(f"/v1/rooms/{rid}/membership",headers=hb).status_code,200)
                     self.assertEqual(client.get(f"/v1/rooms/{rid}/messages",headers=hb).status_code,404)
 
+
+    def test_attachments_gifts_stories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server.DB=str(Path(temp)/"test.sqlite3");server.PEPPER="test-only-key-not-for-deployment-0000000";server.TOKEN=""
+            with TestClient(server.app) as client:
+                def register(tid):
+                    n,code=server.issue(tid)
+                    res=client.post("/v1/auth/verify",json={"number":n,"code":code})
+                    return n,{"Authorization":"Bearer "+res.json()["access_token"]}
+                a,ha=register(21);b,hb=register(22);c,hc=register(23)
+                raw=b"hello attachment"
+                res=client.post("/v1/attachments",params={"recipient":b,"name":"note.txt"},headers=ha,content=raw)
+                self.assertEqual(res.status_code,200);mid=res.json()["id"];aid=res.json()["attachment"]
+                self.assertEqual(client.get("/v1/media/"+aid,headers=hb).content,raw)
+                self.assertEqual(client.get("/v1/media/"+aid,headers=hc).status_code,404)
+                self.assertEqual(client.get("/v1/media/"+aid).status_code,401)
+                self.assertEqual(client.get("/v1/chats/"+a+"/messages",headers=hb).json()["messages"][0]["attachment"]["id"],aid)
+                self.assertEqual(client.delete(f"/v1/messages/{mid}",headers=hb).status_code,200)
+                self.assertEqual(client.get("/v1/media/"+aid,headers=hb).status_code,404)
+                self.assertEqual(client.get("/v1/media/"+aid,headers=ha).status_code,200)
+                self.assertEqual(client.delete(f"/v1/messages/{mid}?everyone=true",headers=ha).status_code,200)
+                self.assertEqual(client.get("/v1/media/"+aid,headers=ha).status_code,404)
+                self.assertEqual(client.put("/v1/avatar",headers=ha,content=raw).status_code,400)
+                self.assertEqual(client.get("/v1/gifts",headers=ha).json()["balance"],1000)
+                res=client.post("/v1/gifts",headers=ha,json={"recipient":b,"kind":"heart"})
+                self.assertEqual(res.status_code,200)
+                self.assertEqual(client.get("/v1/gifts",headers=ha).json()["balance"],950)
+                self.assertEqual(client.get("/v1/gifts",headers=hb).json()["received"][0]["serial"],res.json()["serial"])
+                client.post("/v1/messages",headers=ha,json={"recipient":b,"text":"hi"})
+                sid=client.post("/v1/stories",headers=ha,json={"text":"story"}).json()["id"]
+                self.assertEqual(len(client.get("/v1/stories",headers=hb).json()["stories"]),1)
+                self.assertEqual(client.get("/v1/stories",headers=hc).json()["stories"],[])
+                self.assertEqual(client.delete(f"/v1/stories/{sid}",headers=hb).status_code,404)
+                self.assertEqual(client.delete(f"/v1/stories/{sid}",headers=ha).status_code,200)
+                self.assertEqual(client.get("/v1/stories",headers=hb).json()["stories"],[])
+
 if __name__=="__main__":
     unittest.main()
