@@ -49,7 +49,8 @@ public class MainActivity extends Activity {
     private int BG=0xff17212b, CARD=0xff202b36, INK=0xfff5f5f5, MUTED=0xff8295a6, PURPLE=0xff8c69de;
     private int CHAT=0xff0e1621, OUT=0xff473a70, LINE=0xff283542;
     private boolean light=false;
-    private String ownName="";
+    private String ownName="", ownPhone="";
+    private final java.util.Map<String,String> phones=new java.util.HashMap<>();
     private boolean foreground=true;
     private final ExecutorService network=Executors.newSingleThreadExecutor();
     private String session, account;
@@ -120,7 +121,7 @@ public class MainActivity extends Activity {
         text("Toxicgram",32,INK,true,12);
         text("Вход в свой аккаунт",20,INK,true,8);
         text("Откройте бота Toxicgram в Telegram, отправьте /code и введите выданный виртуальный номер и код.",15,MUTED,false,28);
-        number=field("TG-1234-5678",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS,16);
+        number=field("+388 000 1234567",InputType.TYPE_CLASS_TEXT,32);
         code=field("Код из 6 цифр",InputType.TYPE_CLASS_NUMBER|InputType.TYPE_NUMBER_VARIATION_PASSWORD,6);
         submit=button("Войти");
         status=text("",14,MUTED,false,16);
@@ -128,8 +129,8 @@ public class MainActivity extends Activity {
         submit.setOnClickListener(v->login());
     }
     void login(){
-        String n=number.getText().toString().trim().toUpperCase(Locale.ROOT), c=code.getText().toString().trim();
-        if(!n.matches("TG-[0-9]{4}-[0-9]{4}")||!c.matches("[0-9]{6}")){status.setText("Проверьте формат номера и кода.");return;}
+        String n=identity(number.getText().toString()), c=code.getText().toString().trim();
+        if(!validIdentity(n)||!c.matches("[0-9]{6}")){status.setText("Проверьте формат номера и кода.");return;}
         submit.setEnabled(false);status.setText("Подключение...");
         network.execute(()->{
             try{
@@ -138,7 +139,7 @@ public class MainActivity extends Activity {
                 String token=response.getString("access_token"), id=response.getString("number");
                 JSONObject profile=request("GET","/v1/me",null,token);
                 if(!id.equals(profile.getString("number")))throw new IOException("Account mismatch");
-                runOnUiThread(()->{if(isFinishing()||isDestroyed())return;session=token;account=id;showAccount();});
+                runOnUiThread(()->{if(isFinishing()||isDestroyed())return;session=token;account=id;ownPhone=profile.optString("phone",id);phones.put(id,ownPhone);ownName=profile.optString("name",id);showAccount();});
             }catch(Exception e){
                 runOnUiThread(()->{if(isFinishing()||isDestroyed())return;submit.setEnabled(true);status.setText(e instanceof ApiError?(((ApiError)e).status==429?"Слишком много попыток. Повторите позже.":((ApiError)e).status==401?"Неверный или просроченный код. Получите новый.":"Сервер временно недоступен."):"Не удалось подключиться к серверу.");});
             }
@@ -161,7 +162,7 @@ public class MainActivity extends Activity {
                     if(isDestroyed()||current!=page)return;
                     if(busy!=null)busy.setEnabled(true);
                     if(e instanceof ApiError&&((ApiError)e).status==401){session=null;account=null;showLogin();status.setText("Сеанс завершён. Войдите снова.");return;}
-                    if(error!=null)error.setText(e instanceof ApiError&&((ApiError)e).status==404?"Аккаунт не найден.":e instanceof ApiError&&((ApiError)e).status==429?"Слишком много запросов.":"Ошибка соединения. Повторите позже.");
+                    if(error!=null)error.setText(e instanceof ApiError&&((ApiError)e).status==409?"Username уже занят.":e instanceof ApiError&&((ApiError)e).status==403?"Действие недоступно.":e instanceof ApiError&&((ApiError)e).status==404?"Аккаунт не найден.":e instanceof ApiError&&((ApiError)e).status==429?"Слишком много запросов.":"Ошибка соединения. Повторите позже.");
                 });
             }
         });
@@ -227,22 +228,29 @@ public class MainActivity extends Activity {
         if(sub!=null){TextView small=label(sub,13,MUTED,false);small.setSingleLine();titles.addView(small);}
         bar.addView(titles,new LinearLayout.LayoutParams(0,dp(56),1));layout.addView(bar,new LinearLayout.LayoutParams(-1,dp(56)));return bar;
     }
+    String identity(String input){
+        String s=input.trim();if(s.startsWith("+"))return s.replaceAll("[\\s()-]","");
+        if(s.startsWith("@"))return s.toLowerCase(Locale.ROOT);
+        return s.toUpperCase(Locale.ROOT);
+    }
+    boolean validIdentity(String s){return s.matches("TG-[0-9]{4}-[0-9]{4}")||s.matches("\\+(7|1|388)000[0-9]{7}")||s.matches("@[A-Za-z0-9_]{5,32}");}
+    String displayNumber(String id){return phones.getOrDefault(id,id);}
     void copyId(){
-        ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Toxicgram ID",account));
+        ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Toxicgram ID",displayNumber(account)));
         Toast.makeText(this,"Номер скопирован",Toast.LENGTH_SHORT).show();
     }
     void notice(String s){Toast.makeText(this,s,Toast.LENGTH_SHORT).show();}
     void hideKeyboard(){View focused=getCurrentFocus();if(focused!=null)((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(focused.getWindowToken(),0);}
     void askPeer(){
-        EditText e=new EditText(this);e.setSingleLine();e.setHint("TG-1234-5678");e.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);e.setFilters(new InputFilter[]{new InputFilter.LengthFilter(16)});
+        EditText e=new EditText(this);e.setSingleLine();e.setHint("+7 000 1234567 или @username");e.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);e.setFilters(new InputFilter[]{new InputFilter.LengthFilter(32)});
         FrameLayout wrapper=new FrameLayout(this);wrapper.setPadding(dp(24),dp(12),dp(24),0);wrapper.addView(e,new FrameLayout.LayoutParams(-1,-2));
         android.app.AlertDialog dialog=new android.app.AlertDialog.Builder(this).setTitle("Новый чат").setMessage("Введите виртуальный номер пользователя").setView(wrapper).setNegativeButton("Отмена",null).setPositiveButton("Открыть",null).create();
         dialog.setOnShowListener(v->dialog.getButton(-1).setOnClickListener(w->{
-            String id=e.getText().toString().trim().toUpperCase(Locale.ROOT);
-            if(!id.matches("TG-[0-9]{4}-[0-9]{4}")){e.setError("Неверный формат");return;}
+            String id=identity(e.getText().toString());
+            if(!validIdentity(id)){e.setError("Неверный формат");return;}
             TextView error=new TextView(this);
             final int current=page;final String token=session;dialog.getButton(-1).setEnabled(false);
-            network.execute(()->{try{JSONObject d=request("GET","/v1/users/"+id,null,token);runOnUiThread(()->{if(page!=current||isDestroyed()||!dialog.isShowing())return;dialog.dismiss();hideKeyboard();showChat(id,d.optString("name",id));});}catch(Exception ex){runOnUiThread(()->{if(page!=current||isDestroyed()||!dialog.isShowing())return;dialog.getButton(-1).setEnabled(true);e.setError(ex instanceof ApiError&&((ApiError)ex).status==404?"Пользователь не найден":"Не удалось подключиться");});}});
+            network.execute(()->{try{JSONObject d=request("GET","/v1/users/"+id,null,token);runOnUiThread(()->{if(page!=current||isDestroyed()||!dialog.isShowing())return;dialog.dismiss();hideKeyboard();String canonical=d.optString("number",id);phones.put(canonical,d.optString("phone",canonical));showChat(canonical,d.optString("name",canonical));});}catch(Exception ex){runOnUiThread(()->{if(page!=current||isDestroyed()||!dialog.isShowing())return;dialog.getButton(-1).setEnabled(true);e.setError(ex instanceof ApiError&&((ApiError)ex).status==404?"Пользователь не найден":"Не удалось подключиться");});}});
         }));dialog.show();
     }
     void drawer(){
@@ -250,7 +258,7 @@ public class MainActivity extends Activity {
         LinearLayout menu=column();menu.setBackgroundColor(BG);
         LinearLayout head=column();head.setBackgroundColor(CARD);head.setPadding(dp(20),dp(24),dp(20),dp(18));
         head.addView(avatar(ownName.isEmpty()?account:ownName,28),new LinearLayout.LayoutParams(dp(64),dp(64)));
-        TextView nm=label(ownName.isEmpty()?"Toxicgram":ownName,18,INK,true);nm.setPadding(0,dp(12),0,dp(4));head.addView(nm);head.addView(label(account,14,MUTED,false));head.setOnClickListener(v->{dialog.dismiss();copyId();});menu.addView(head);
+        TextView nm=label(ownName.isEmpty()?"Toxicgram":ownName,18,INK,true);nm.setPadding(0,dp(12),0,dp(4));head.addView(nm);head.addView(label(displayNumber(account),14,MUTED,false));head.setOnClickListener(v->{dialog.dismiss();copyId();});menu.addView(head);
         String[] names={"Мой профиль","Новый чат","Избранное","Архив","Скопировать номер",light?"Тёмная тема":"Светлая тема","Выйти"};
         String[] glyphs={"◉","✎","☆","▣","⧉",light?"☾":"☀","↪"};
         for(int i=0;i<names.length;i++){
@@ -290,9 +298,9 @@ public class MainActivity extends Activity {
             list.removeAllViews();String q=search.getText().toString().trim().toLowerCase(Locale.ROOT);int visible=0;
             for(int i=0;i<cache[0].length();i++){
                 JSONObject row=cache[0].optJSONObject(i);if(row==null)continue;
-                String id=row.optString("number"),name=id.equals(account)?"Избранное":row.optString("name",id),msg=row.optString("text");
+                String id=row.optString("number"),name=id.equals(account)?"Избранное":row.optString("name",id),msg=row.optString("text");phones.put(id,row.optString("phone",id));
                 if((row.optInt("archived")!=0)!=archived)continue;
-                if(!q.isEmpty()&&!(name+" "+id+" "+msg).toLowerCase(Locale.ROOT).contains(q))continue;visible++;
+                if(!q.isEmpty()&&!(name+" "+displayNumber(id)+" "+id+" "+msg).toLowerCase(Locale.ROOT).contains(q))continue;visible++;
                 LinearLayout cell=horizontal();cell.setBackground(ripple(BG,0));cell.setPadding(dp(12),0,dp(16),0);
                 cell.addView(avatar(name,23),new LinearLayout.LayoutParams(dp(54),dp(54)));
                 LinearLayout content=column();content.setPadding(dp(12),0,0,0);
@@ -304,26 +312,26 @@ public class MainActivity extends Activity {
         };
         search.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int a,int n,int f){}public void onTextChanged(CharSequence s,int a,int b,int n){render.run();}public void afterTextChanged(Editable e){}});
         Runnable load=()->{if(loading[0])return;loading[0]=true;String token=session;network.execute(()->{try{JSONObject d=request("GET","/v1/chats",null,token);runOnUiThread(()->{loading[0]=false;if(isDestroyed()||page!=current)return;info.setText("");JSONArray arr=d.optJSONArray("chats");if(arr!=null){String value=arr.toString();if(!value.equals(snapshot[0])){snapshot[0]=value;cache[0]=arr;render.run();}}});}catch(Exception e){runOnUiThread(()->{loading[0]=false;if(isDestroyed()||page!=current)return;if(e instanceof ApiError&&((ApiError)e).status==401){session=null;account=null;showLogin();return;}info.setText("Подключение…");});}});};
-        call("GET","/v1/profile",null,d->ownName=d.optString("name",account),null,null);
+        call("GET","/v1/profile",null,d->{ownName=d.optString("name",account);ownPhone=d.optString("phone",account);phones.put(account,ownPhone);},null,null);
         render.run();load.run();timer.postDelayed(new Runnable(){public void run(){if(isDestroyed()||page!=current)return;if(foreground)load.run();timer.postDelayed(this,5000);}},5000);
     }
     void showProfile(){
         LinearLayout layout=pageLayout();LinearLayout bar=toolbar(layout,"Профиль",null,()->showAccount());line(layout,0);
-        LinearLayout main=column();main.setPadding(dp(22),dp(32),dp(22),dp(20));main.setGravity(Gravity.CENTER_HORIZONTAL);layout.addView(main,new LinearLayout.LayoutParams(-1,-2));
+        LinearLayout main=column();main.setPadding(dp(22),dp(32),dp(22),dp(20));main.setGravity(Gravity.CENTER_HORIZONTAL);ScrollView profileScroll=new ScrollView(this);profileScroll.addView(main,new ScrollView.LayoutParams(-1,-2));layout.addView(profileScroll,new LinearLayout.LayoutParams(-1,0,1));
         TextView photo=avatar(ownName.isEmpty()?account:ownName,42);main.addView(photo,new LinearLayout.LayoutParams(dp(100),dp(100)));
         TextView title=label(ownName.isEmpty()?account:ownName,23,INK,true);title.setPadding(0,dp(16),0,dp(8));main.addView(title);
-        TextView id=label(account,16,PURPLE,false);id.setOnClickListener(v->copyId());main.addView(id);
+        TextView id=label(displayNumber(account),16,PURPLE,false);id.setOnClickListener(v->copyId());main.addView(id);
         root=main;TextView hint=text("Имя пользователя",13,MUTED,false,8);hint.setPadding(0,dp(30),0,0);
-        EditText name=field("Имя",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,64);name.setText(ownName);TextView info=text("",14,MUTED,false,8);
-        Button save=button("Сохранить");call("GET","/v1/profile",null,d->{name.setText(d.getString("name"));},info,save);
-        save.setOnClickListener(v->{String value=name.getText().toString().trim();if(value.isEmpty()){name.setError("Введите имя");return;}call("PUT","/v1/profile",data("name",value),d->{ownName=d.optString("name",value);hideKeyboard();showAccount();},info,save);});
+        EditText name=field("Имя",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,64);name.setText(ownName);EditText username=field("@username",InputType.TYPE_CLASS_TEXT,32);EditText bio=field("О себе",InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,160);TextView info=text("",14,MUTED,false,8);
+        Button save=button("Сохранить");call("GET","/v1/profile",null,d->{name.setText(d.getString("name"));username.setText(d.optString("username"));bio.setText(d.optString("bio"));phones.put(account,d.optString("phone",account));id.setText(displayNumber(account));},info,save);
+        save.setOnClickListener(v->{String value=name.getText().toString().trim();if(value.isEmpty()){name.setError("Введите имя");return;}String u=username.getText().toString().trim().replaceFirst("^@","");if(!u.isEmpty()&&!u.matches("[A-Za-z0-9_]{5,32}")){username.setError("От 5 до 32 латинских букв, цифр или _");return;}JSONObject payload=data("name",value);try{payload.put("username",u);payload.put("bio",bio.getText().toString().trim());}catch(Exception ignored){}call("PUT","/v1/profile",payload,d->{ownName=d.optString("name",value);hideKeyboard();showAccount();},info,save);});
     }
     void showChat(String peer,String name){
         LinearLayout layout=pageLayout();final int current=page;
         LinearLayout bar=horizontal();bar.addView(icon("back","Назад",()->{hideKeyboard();showAccount();}),new LinearLayout.LayoutParams(dp(48),dp(56)));
         bar.addView(avatar(name,19),new LinearLayout.LayoutParams(dp(40),dp(40)));
-        LinearLayout titles=column();titles.setPadding(dp(12),0,0,0);TextView heading=label(name,18,INK,true);heading.setSingleLine();heading.setEllipsize(TextUtils.TruncateAt.END);titles.addView(heading);titles.addView(label(peer,12,MUTED,false));bar.addView(titles,new LinearLayout.LayoutParams(0,-2,1));
-        ImageButton more=icon("more","Меню чата",()->{});more.setOnClickListener(v->{PopupMenu popup=new PopupMenu(this,more);popup.getMenu().add("Скопировать номер");popup.setOnMenuItemClickListener(item->{((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Toxicgram ID",peer));notice("Номер скопирован");return true;});popup.show();});bar.addView(more,new LinearLayout.LayoutParams(dp(48),dp(56)));layout.addView(bar,new LinearLayout.LayoutParams(-1,dp(56)));line(layout,0);
+        LinearLayout titles=column();titles.setPadding(dp(12),0,0,0);TextView heading=label(name,18,INK,true);heading.setSingleLine();heading.setEllipsize(TextUtils.TruncateAt.END);titles.addView(heading);titles.addView(label(displayNumber(peer),12,MUTED,false));bar.addView(titles,new LinearLayout.LayoutParams(0,-2,1));
+        ImageButton more=icon("more","Меню чата",()->{});more.setOnClickListener(v->{PopupMenu popup=new PopupMenu(this,more);popup.getMenu().add("Скопировать номер");if(!peer.equals(account)){popup.getMenu().add("Заблокировать");popup.getMenu().add("Разблокировать");}popup.setOnMenuItemClickListener(item->{if(!item.getTitle().equals("Скопировать номер")){boolean block=item.getTitle().equals("Заблокировать");JSONObject data=new JSONObject();try{data.put("blocked",block);}catch(Exception ignored){}call("PUT","/v1/users/"+peer+"/block",data,x->notice(block?"Пользователь заблокирован":"Пользователь разблокирован"),null,null);return true;}((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Toxicgram ID",displayNumber(peer)));notice("Номер скопирован");return true;});popup.show();});bar.addView(more,new LinearLayout.LayoutParams(dp(48),dp(56)));layout.addView(bar,new LinearLayout.LayoutParams(-1,dp(56)));line(layout,0);
         FrameLayout backdrop=new FrameLayout(this);backdrop.setBackgroundColor(CHAT);layout.addView(backdrop,new LinearLayout.LayoutParams(-1,0,1));
         View pattern=new View(this){final Paint p=new Paint(3);@Override protected void onDraw(Canvas canvas){super.onDraw(canvas);p.setStyle(Paint.Style.STROKE);p.setStrokeWidth(dp(1));p.setColor(light?0x177250c8:0x163c6c95);for(int y=dp(25);y<getHeight();y+=dp(72))for(int x=dp(22);x<getWidth();x+=dp(76)){int shift=(y/dp(72)%2)*dp(20);canvas.drawCircle(x+shift,y,dp(10),p);canvas.drawLine(x+shift-dp(5),y,x+shift+dp(5),y,p);}}};backdrop.addView(pattern,new FrameLayout.LayoutParams(-1,-1));
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout history=column();history.setPadding(dp(10),dp(12),dp(10),dp(12));history.setGravity(Gravity.BOTTOM);scroll.addView(history,new ScrollView.LayoutParams(-1,-2));backdrop.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
@@ -339,8 +347,8 @@ public class MainActivity extends Activity {
                 JSONObject msg=arr.optJSONObject(i);if(msg==null)continue;boolean mine=account.equals(msg.optString("sender"));long created=msg.optLong("created");String day=DateFormat.format("dd MMMM yyyy",new Date(created*1000L)).toString();
                 if(!day.equals(previousDay)){TextView date=label(day,12,Color.WHITE,true);date.setGravity(Gravity.CENTER);date.setPadding(dp(12),dp(5),dp(12),dp(5));date.setBackground(shape(0xff64758a,16));LinearLayout.LayoutParams datep=new LinearLayout.LayoutParams(-2,-2);datep.gravity=Gravity.CENTER;datep.setMargins(0,dp(8),0,dp(12));history.addView(date,datep);previousDay=day;}
                 LinearLayout bubble=column();bubble.setPadding(dp(12),dp(8),dp(10),dp(6));GradientDrawable bg=new GradientDrawable();bg.setColor(mine?OUT:CARD);float rad=dp(16),tail=dp(4);bg.setCornerRadii(mine?new float[]{rad,rad,rad,rad,tail,tail,rad,rad}:new float[]{rad,rad,rad,rad,rad,rad,tail,tail});bubble.setBackground(bg);
-                TextView body=label(msg.optString("text"),16,INK,false);body.setMaxWidth(Math.min(dp(310),(int)(getResources().getDisplayMetrics().widthPixels*.76)));body.setTextIsSelectable(false);bubble.addView(body,new LinearLayout.LayoutParams(-2,-2));
-                TextView stamp=label((msg.optLong("edited")>0?"изм. ":"")+DateFormat.format("HH:mm",new Date(created*1000L)).toString()+(mine?"  ✓":""),11,mine?PURPLE:MUTED,false);stamp.setGravity(Gravity.RIGHT);LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(-1,-2);tp.topMargin=dp(3);bubble.addView(stamp,tp);LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-2,-2);bp.gravity=mine?Gravity.RIGHT:Gravity.LEFT;bp.bottomMargin=dp(5);history.addView(bubble,bp);View.OnLongClickListener actions=v->{messageActions(msg,mine,peer,name,info);return true;};bubble.setOnLongClickListener(actions);body.setOnLongClickListener(actions);
+                TextView body=label(msg.optString("text"),16,INK,false);body.setMaxWidth(Math.min(dp(310),(int)(getResources().getDisplayMetrics().widthPixels*.76)));body.setTextIsSelectable(false);bubble.addView(body,new LinearLayout.LayoutParams(-2,-2));JSONArray reactions=msg.optJSONArray("reactions");if(reactions!=null&&reactions.length()>0){StringBuilder emojis=new StringBuilder();for(int ri=0;ri<reactions.length();ri++){JSONObject rx=reactions.optJSONObject(ri);if(rx!=null)emojis.append(rx.optString("emoji")).append(" ").append(rx.optInt("count")).append("  ");}TextView reaction=label(emojis.toString().trim(),14,PURPLE,true);bubble.addView(reaction);}
+                TextView stamp=label((msg.optLong("edited")>0?"изм. ":"")+DateFormat.format("HH:mm",new Date(created*1000L)).toString()+(mine?(msg.optBoolean("read")?"  ✓✓":"  ✓"):""),11,mine?PURPLE:MUTED,false);stamp.setGravity(Gravity.RIGHT);LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(-1,-2);tp.topMargin=dp(3);bubble.addView(stamp,tp);LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-2,-2);bp.gravity=mine?Gravity.RIGHT:Gravity.LEFT;bp.bottomMargin=dp(5);history.addView(bubble,bp);View.OnLongClickListener actions=v->{messageActions(msg,mine,peer,name,info);return true;};bubble.setOnLongClickListener(actions);body.setOnLongClickListener(actions);
             }
             if(bottom)scroll.post(()->scroll.fullScroll(View.FOCUS_DOWN));
         });}catch(Exception e){runOnUiThread(()->{loading[0]=false;if(isDestroyed()||page!=current)return;if(e instanceof ApiError&&((ApiError)e).status==401){session=null;account=null;showLogin();return;}info.setText("Подключение…");});}});};
@@ -349,13 +357,14 @@ public class MainActivity extends Activity {
     }
     void messageActions(JSONObject msg,boolean mine,String peer,String name,TextView info){
         long id=msg.optLong("id");String value=msg.optString("text");
-        String[] options=mine?new String[]{"Копировать","Переслать","В избранное","Изменить","Удалить у себя","Удалить у всех"}:new String[]{"Копировать","Переслать","В избранное","Удалить у себя"};
+        String[] options=mine?new String[]{"Реакция","Копировать","Переслать","В избранное","Изменить","Удалить у себя","Удалить у всех"}:new String[]{"Реакция","Копировать","Переслать","В избранное","Удалить у себя"};
         new android.app.AlertDialog.Builder(this).setTitle("Сообщение").setItems(options,(d,i)->{
             String choice=options[i];
             switch(choice){
+                case "Реакция":String[] emoji={"👍","❤️","🔥","😂","😢","👎","Убрать реакцию"};new android.app.AlertDialog.Builder(this).setTitle("Реакция").setItems(emoji,(dlg,index)->call("PUT","/v1/messages/"+id+"/reaction",data("emoji",index==6?"":emoji[index]),x->showChat(peer,name),info,null)).show();break;
                 case "Копировать":((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Toxicgram",value));notice("Скопировано");break;
                 case "В избранное":JSONObject saved=data("recipient",account);try{saved.put("text",value);}catch(Exception ignored){}call("POST","/v1/messages",saved,x->notice("Сохранено"),info,null);break;
-                case "Переслать":EditText target=new EditText(this);target.setSingleLine();target.setHint("TG-1234-5678");target.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);android.app.AlertDialog forward=new android.app.AlertDialog.Builder(this).setTitle("Переслать текст").setView(target).setNegativeButton("Отмена",null).setPositiveButton("Отправить",null).create();forward.setOnShowListener(v->forward.getButton(-1).setOnClickListener(w->{String recipient=target.getText().toString().trim().toUpperCase(Locale.ROOT);if(!recipient.matches("TG-[0-9]{4}-[0-9]{4}")){target.setError("Неверный номер");return;}JSONObject payload=data("recipient",recipient);try{payload.put("text",value);}catch(Exception ignored){}forward.dismiss();call("POST","/v1/messages",payload,x->notice("Переслано"),info,null);}));forward.show();break;
+                case "Переслать":EditText target=new EditText(this);target.setSingleLine();target.setHint("+388 000 1234567 или @username");target.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);android.app.AlertDialog forward=new android.app.AlertDialog.Builder(this).setTitle("Переслать текст").setView(target).setNegativeButton("Отмена",null).setPositiveButton("Отправить",null).create();forward.setOnShowListener(v->forward.getButton(-1).setOnClickListener(w->{String recipient=identity(target.getText().toString());if(!validIdentity(recipient)){target.setError("Неверный номер");return;}JSONObject payload=data("recipient",recipient);try{payload.put("text",value);}catch(Exception ignored){}forward.dismiss();call("POST","/v1/messages",payload,x->notice("Переслано"),info,null);}));forward.show();break;
                 case "Изменить":EditText edit=new EditText(this);edit.setText(value);edit.setFilters(new InputFilter[]{new InputFilter.LengthFilter(4000)});edit.setMinLines(2);android.app.AlertDialog change=new android.app.AlertDialog.Builder(this).setTitle("Редактировать сообщение").setView(edit).setNegativeButton("Отмена",null).setPositiveButton("Сохранить",null).create();change.setOnShowListener(v->change.getButton(-1).setOnClickListener(w->{String text=edit.getText().toString().trim();if(text.isEmpty()){edit.setError("Пустое сообщение");return;}change.dismiss();call("PUT","/v1/messages/"+id,data("text",text),x->showChat(peer,name),info,null);}));change.show();break;
                 default:boolean everyone=choice.equals("Удалить у всех");new android.app.AlertDialog.Builder(this).setTitle(choice+"?").setMessage(everyone?"Сообщение исчезнет у обоих участников.":"Сообщение исчезнет только у вас.").setNegativeButton("Отмена",null).setPositiveButton("Удалить",(a,b)->call("DELETE","/v1/messages/"+id+"?everyone="+everyone,null,x->showChat(peer,name),info,null)).show();
             }
