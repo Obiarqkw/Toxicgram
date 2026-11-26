@@ -929,7 +929,7 @@ public class GiftSheet extends BottomSheetWithRecyclerListView implements Notifi
 
     public void fillItems(ArrayList<UItem> items, UniversalAdapter adapter) {
         boolean pushedTopView = false;
-        if (!self && dialogId >= 0 && !(userSettings != null && userSettings.disallow_premium_gifts)) {
+        if (!org.telegram.tgnet.ToxicgramRpc.ENABLED && !self && dialogId >= 0 && !(userSettings != null && userSettings.disallow_premium_gifts)) {
             items.add(UItem.asCustom(topView));
             pushedTopView = true;
             items.add(UItem.asCustom(premiumHeaderView));
@@ -978,7 +978,7 @@ public class GiftSheet extends BottomSheetWithRecyclerListView implements Notifi
                 }
             }
         }
-        if (!MessagesController.getInstance(currentAccount).stargiftsBlocked && (!gifts.isEmpty() || userSettings != null && !userSettings.disallow_unique_stargifts && myGifts != null && !myGifts.gifts.isEmpty())) {
+        if ((org.telegram.tgnet.ToxicgramRpc.ENABLED || !MessagesController.getInstance(currentAccount).stargiftsBlocked) && (!gifts.isEmpty() || userSettings != null && !userSettings.disallow_unique_stargifts && myGifts != null && !myGifts.gifts.isEmpty())) {
             if (!pushedTopView) {
                 items.add(UItem.asCustom(topView));
             } else {
@@ -1007,9 +1007,13 @@ public class GiftSheet extends BottomSheetWithRecyclerListView implements Notifi
                 TAB_MY_GIFTS = tabs.size();
                 tabs.add(getString(R.string.Gift2TabMine));
             }
-            TAB_COLLECTIBLES = tabs.size();
-            tabs.add(getString(R.string.Gift2TabCollectibles));
-            if (browseCollectibles && !browseTabApplied) {
+            TAB_COLLECTIBLES = -1;
+            if (!org.telegram.tgnet.ToxicgramRpc.ENABLED) {
+                TAB_COLLECTIBLES = tabs.size();
+                tabs.add(getString(R.string.Gift2TabCollectibles));
+            }
+            if (org.telegram.tgnet.ToxicgramRpc.ENABLED && selectedTab >= tabs.size()) selectedTab = TAB_ALL;
+            if (TAB_COLLECTIBLES >= 0 && browseCollectibles && !browseTabApplied) {
                 browseTabApplied = true;
                 selectedTab = TAB_COLLECTIBLES;
             }
