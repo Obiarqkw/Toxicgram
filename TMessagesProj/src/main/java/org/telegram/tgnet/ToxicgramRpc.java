@@ -236,7 +236,7 @@ public final class ToxicgramRpc {
         return base+Long.parseLong(id.substring(0,15),16);
     }
     private static File avatarFile(int a,long id){
-        return new File(new File(ApplicationLoader.applicationContext.getCacheDir(),"toxicgram_avatars_"+a),id+".jpg");
+        return new File(new File(ApplicationLoader.applicationContext.getCacheDir(),"toxicgram_avatars_v2_"+a+"_"+prefs(a).getString("number","").replaceAll("[^A-Za-z0-9-]","")),id+".jpg");
     }
     public static String avatarPath(int a,long id){
         if(id<AVATAR_BASE||id>=AVATAR_BASE+(1L<<60))return null;
@@ -270,6 +270,7 @@ public final class ToxicgramRpc {
         TLRPC.TL_user u=new TLRPC.TL_user();
         u.id=userId(p.getString("number"));u.first_name=p.optString("first_name",p.optString("name",p.optString("phone","Toxicgram")));u.last_name=p.optString("last_name","");
         u.phone=p.optString("phone","").replace("+","");u.username=p.optString("username","");
+        self=p.getString("number").equals(prefs(a).getString("number","")) || self;
         u.self=self;u.flags=2|4|16|(u.username.isEmpty()?0:8)|(self?1024:0);
         u.access_hash=u.id;u.flags|=1;
         if(p.has("last_seen")){u.status=presence(p);u.flags|=64;}
@@ -279,7 +280,7 @@ public final class ToxicgramRpc {
             TLRPC.TL_userProfilePhoto photo=new TLRPC.TL_userProfilePhoto();photo.photo_id=id;photo.dc_id=1;photo.photo_small=avatarLocation(id,'a');photo.photo_big=avatarLocation(id,'c');
             u.photo=photo;u.flags|=32;
             try{fetchAsset(a,asset,avatarFile(a,id),512*1024);}catch(Exception ignored){}
-        }else if(p.has("avatar")){u.photo=new TLRPC.TL_userProfilePhotoEmpty();u.flags|=32;}
+        }else{u.photo=new TLRPC.TL_userProfilePhotoEmpty();u.flags|=32;}
         return u;
     }
     private static String canonical(long id) throws ApiError {
