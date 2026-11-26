@@ -1,6 +1,10 @@
 package com.toxicgram.app;
 
 import android.app.Activity;
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.media.MediaRecorder;
+import android.media.MediaPlayer;
 import android.content.Intent;
 import android.net.Uri;
 import android.graphics.Bitmap;
@@ -60,6 +64,7 @@ public class MainActivity extends Activity {
     private final java.util.Map<String,String> phones=new java.util.HashMap<>();
     private boolean foreground=true;
     private String pendingPeer="",pendingName="",pendingMedia="",pendingFilename="",pendingToken="";
+    private MediaRecorder recorder;private File recording;private MediaPlayer player;private File playback;
     private int pendingPage=-1;
     private Runnable pendingRefresh;
     private final java.util.Map<String,String> avatarIds=new java.util.HashMap<>();
@@ -205,6 +210,8 @@ public class MainActivity extends Activity {
                 case "back":canvas.drawLine(4,12,20,12,p);canvas.drawLine(4,12,11,5,p);canvas.drawLine(4,12,11,19,p);break;
                 case "search":canvas.drawCircle(10,10,6,p);canvas.drawLine(15,15,21,21,p);break;
                 case "edit":canvas.drawLine(4,20,8,19,p);canvas.drawLine(8,19,20,7,p);canvas.drawLine(20,7,17,4,p);canvas.drawLine(17,4,5,16,p);canvas.drawLine(5,16,4,20,p);canvas.drawLine(15,6,18,9,p);break;
+                case "attach":canvas.drawRoundRect(new RectF(6,2,18,22),6,6,p);canvas.drawLine(10,7,10,17,p);break;
+                case "mic":canvas.drawRoundRect(new RectF(9,2,15,14),3,3,p);canvas.drawArc(new RectF(6,5,18,18),0,180,false,p);canvas.drawLine(12,18,12,22,p);canvas.drawLine(8,22,16,22,p);break;
                 case "send":p.setStyle(Paint.Style.FILL);Path a=new Path();a.moveTo(2,3);a.lineTo(23,12);a.lineTo(2,21);a.lineTo(6,13);a.lineTo(16,12);a.lineTo(6,11);a.close();canvas.drawPath(a,p);break;
                 case "more":p.setStyle(Paint.Style.FILL);for(int y=5;y<=19;y+=7)canvas.drawCircle(12,y,1.7f,p);break;
                 case "check":canvas.drawLine(4,12,9,17,p);canvas.drawLine(9,17,20,6,p);break;
@@ -306,13 +313,13 @@ public class MainActivity extends Activity {
         FrameLayout area=new FrameLayout(this);layout.addView(area,new LinearLayout.LayoutParams(-1,0,1));
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout list=column();list.setPadding(0,0,0,dp(84));scroll.addView(list,new ScrollView.LayoutParams(-1,-2));area.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
         ImageButton fab=circleAction("edit","Новый чат",()->askPeer());FrameLayout.LayoutParams fp=new FrameLayout.LayoutParams(dp(56),dp(56),Gravity.BOTTOM|Gravity.RIGHT);fp.setMargins(0,0,dp(16),dp(18));area.addView(fab,fp);fab.setElevation(dp(5));
-        final JSONArray[] cache={new JSONArray()};final String[] snapshot={""};final boolean[] loading={false};
+        final JSONArray[] cache={new JSONArray()};final String[] snapshot={""};final boolean[] loading={false};final int[] folder={0};
         Runnable render=()->{
             list.removeAllViews();String q=search.getText().toString().trim().toLowerCase(Locale.ROOT);int visible=0;
             for(int i=0;i<cache[0].length();i++){
                 JSONObject row=cache[0].optJSONObject(i);if(row==null)continue;
                 String id=row.optString("number"),name=id.equals(account)?"Избранное":row.optString("name",id),msg=row.optString("text");phones.put(id,row.optString("phone",id));avatarIds.put(id,row.optString("avatar",""));
-                if((row.optInt("archived")!=0)!=archived)continue;
+                if((row.optInt("archived")!=0)!=archived)continue;if(folder[0]==1&&row.optInt("unread")==0)continue;if(folder[0]==2&&row.optInt("pinned")==0)continue;
                 if(!q.isEmpty()&&!(name+" "+displayNumber(id)+" "+id+" "+msg).toLowerCase(Locale.ROOT).contains(q))continue;visible++;
                 LinearLayout cell=horizontal();cell.setBackground(ripple(BG,0));cell.setPadding(dp(12),0,dp(16),0);
                 cell.addView(photoAvatar(name,id,23),new LinearLayout.LayoutParams(dp(54),dp(54)));
@@ -323,6 +330,7 @@ public class MainActivity extends Activity {
             }
             if(visible==0){LinearLayout empty=column();empty.setGravity(Gravity.CENTER);empty.setPadding(dp(28),dp(70),dp(28),dp(20));TextView t=label(q.isEmpty()?"Пока нет чатов":"Ничего не найдено",20,INK,true);t.setGravity(Gravity.CENTER);empty.addView(t);TextView hint=label(q.isEmpty()?"Начните переписку по виртуальному номеру друга.":"Введите точный номер в новом чате.",15,MUTED,false);hint.setPadding(0,dp(10),0,0);hint.setGravity(Gravity.CENTER);empty.addView(hint);list.addView(empty,new LinearLayout.LayoutParams(-1,-2));}
         };
+        if(!archived){tab.setOnClickListener(v->{String[] folders={"Все чаты","Непрочитанные","Закреплённые"};new android.app.AlertDialog.Builder(this).setTitle("Папки чатов").setSingleChoiceItems(folders,folder[0],(dlg,index)->{folder[0]=index;tab.setText(folders[index]+" ▾");render.run();dlg.dismiss();}).show();});tab.setText("Все чаты ▾");}
         search.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int a,int n,int f){}public void onTextChanged(CharSequence s,int a,int b,int n){render.run();}public void afterTextChanged(Editable e){}});
         Runnable load=()->{if(loading[0])return;loading[0]=true;String token=session;network.execute(()->{try{JSONObject d=request("GET","/v1/chats",null,token);runOnUiThread(()->{loading[0]=false;if(isDestroyed()||page!=current)return;info.setText("");JSONArray arr=d.optJSONArray("chats");if(arr!=null){String value=arr.toString();if(!value.equals(snapshot[0])){snapshot[0]=value;cache[0]=arr;render.run();}}});}catch(Exception e){runOnUiThread(()->{loading[0]=false;if(isDestroyed()||page!=current)return;if(e instanceof ApiError&&((ApiError)e).status==401){session=null;account=null;showLogin();return;}info.setText("Подключение…");});}});};
         call("GET","/v1/profile",null,d->{ownName=d.optString("name",account);ownPhone=d.optString("phone",account);phones.put(account,ownPhone);avatarIds.put(account,d.optString("avatar",""));},null,null);
@@ -350,8 +358,8 @@ public class MainActivity extends Activity {
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout history=column();history.setPadding(dp(10),dp(12),dp(10),dp(12));history.setGravity(Gravity.BOTTOM);scroll.addView(history,new ScrollView.LayoutParams(-1,-2));backdrop.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
         TextView info=label("",12,MUTED,false);info.setGravity(Gravity.CENTER);layout.addView(info);
         LinearLayout composerRow=horizontal();composerRow.setPadding(dp(8),dp(6),dp(8),dp(6));composerRow.setBackgroundColor(BG);
-        ImageButton attach=icon("edit","Прикрепить файл",()->pickAttachment(peer,name));composerRow.addView(attach,new LinearLayout.LayoutParams(dp(40),dp(46)));
-        EditText composer=new EditText(this);composer.setTextColor(INK);composer.setHintTextColor(MUTED);composer.setHint("Сообщение");composer.setTextSize(16);composer.setMinLines(1);composer.setMaxLines(4);composer.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_MULTI_LINE|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);composer.setFilters(new InputFilter[]{new InputFilter.LengthFilter(4000)});composer.setPadding(dp(15),dp(12),dp(15),dp(12));composer.setBackground(shape(CARD,24));composerRow.addView(composer,new LinearLayout.LayoutParams(0,-2,1));
+        ImageButton attach=icon("attach","Прикрепить файл",()->pickAttachment(peer,name));composerRow.addView(attach,new LinearLayout.LayoutParams(dp(40),dp(46)));
+        EditText composer=new EditText(this);composer.setTextColor(INK);composer.setHintTextColor(MUTED);composer.setHint("Сообщение");composer.setTextSize(16);composer.setMinLines(1);composer.setMaxLines(4);composer.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_MULTI_LINE|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);composer.setFilters(new InputFilter[]{new InputFilter.LengthFilter(4000)});composer.setPadding(dp(15),dp(12),dp(15),dp(12));composer.setBackground(shape(CARD,24));composerRow.addView(composer,new LinearLayout.LayoutParams(0,-2,1));ImageButton mic=icon("mic","Голосовое сообщение",()->recordVoice(peer,name));composerRow.addView(mic,new LinearLayout.LayoutParams(dp(36),dp(46)));
         ImageButton send=circleAction("send","Отправить сообщение",()->{});LinearLayout.LayoutParams sp=new LinearLayout.LayoutParams(dp(46),dp(46));sp.leftMargin=dp(6);composerRow.addView(send,sp);layout.addView(composerRow,new LinearLayout.LayoutParams(-1,-2));
         final long[] last={-1};final String[] signature={""};final boolean[] loading={false};
         Runnable load=()->{if(loading[0])return;loading[0]=true;String token=session;network.execute(()->{try{JSONObject d=request("GET","/v1/chats/"+peer+"/messages",null,token);runOnUiThread(()->{
@@ -361,7 +369,7 @@ public class MainActivity extends Activity {
                 JSONObject msg=arr.optJSONObject(i);if(msg==null)continue;boolean mine=account.equals(msg.optString("sender"));long created=msg.optLong("created");String day=DateFormat.format("dd MMMM yyyy",new Date(created*1000L)).toString();
                 if(!day.equals(previousDay)){TextView date=label(day,12,Color.WHITE,true);date.setGravity(Gravity.CENTER);date.setPadding(dp(12),dp(5),dp(12),dp(5));date.setBackground(shape(0xff64758a,16));LinearLayout.LayoutParams datep=new LinearLayout.LayoutParams(-2,-2);datep.gravity=Gravity.CENTER;datep.setMargins(0,dp(8),0,dp(12));history.addView(date,datep);previousDay=day;}
                 LinearLayout bubble=column();bubble.setPadding(dp(12),dp(8),dp(10),dp(6));GradientDrawable bg=new GradientDrawable();bg.setColor(mine?OUT:CARD);float rad=dp(16),tail=dp(4);bg.setCornerRadii(mine?new float[]{rad,rad,rad,rad,tail,tail,rad,rad}:new float[]{rad,rad,rad,rad,rad,rad,tail,tail});bubble.setBackground(bg);
-                JSONObject attachment=msg.optJSONObject("attachment");TextView body=label(msg.optString("text"),16,INK,false);body.setMaxWidth(Math.min(dp(310),(int)(getResources().getDisplayMetrics().widthPixels*.76)));body.setTextIsSelectable(false);bubble.addView(body,new LinearLayout.LayoutParams(-2,-2));if(attachment!=null){String aid=attachment.optString("id"),filename=attachment.optString("name","file"),mime=attachment.optString("mime");if(mime.startsWith("image/")){ImageView preview=new ImageView(this);preview.setScaleType(ImageView.ScaleType.CENTER_CROP);preview.setBackground(shape(CHAT,10));bubble.addView(preview,new LinearLayout.LayoutParams(dp(220),dp(150)));loadImage(aid,preview,512);preview.setOnClickListener(v->saveAttachment(aid,filename,mime));}TextView download=label("↓  Сохранить файл · "+(attachment.optLong("size")/1024)+" КБ",13,PURPLE,true);download.setPadding(0,dp(8),0,dp(5));bubble.addView(download);download.setOnClickListener(v->saveAttachment(aid,filename,mime));}JSONArray reactions=msg.optJSONArray("reactions");if(reactions!=null&&reactions.length()>0){StringBuilder emojis=new StringBuilder();for(int ri=0;ri<reactions.length();ri++){JSONObject rx=reactions.optJSONObject(ri);if(rx!=null)emojis.append(rx.optString("emoji")).append(" ").append(rx.optInt("count")).append("  ");}TextView reaction=label(emojis.toString().trim(),14,PURPLE,true);bubble.addView(reaction);}
+                JSONObject attachment=msg.optJSONObject("attachment");TextView body=label(msg.optString("text"),16,INK,false);body.setMaxWidth(Math.min(dp(310),(int)(getResources().getDisplayMetrics().widthPixels*.76)));body.setTextIsSelectable(false);bubble.addView(body,new LinearLayout.LayoutParams(-2,-2));if(attachment!=null){String aid=attachment.optString("id"),filename=attachment.optString("name","file"),mime=attachment.optString("mime");if(mime.startsWith("image/")){ImageView preview=new ImageView(this);preview.setScaleType(ImageView.ScaleType.CENTER_CROP);preview.setBackground(shape(CHAT,10));bubble.addView(preview,new LinearLayout.LayoutParams(dp(220),dp(150)));loadImage(aid,preview,512);preview.setOnClickListener(v->saveAttachment(aid,filename,mime));}TextView download=label("↓  Сохранить файл · "+(attachment.optLong("size")/1024)+" КБ",13,PURPLE,true);download.setPadding(0,dp(8),0,dp(5));bubble.addView(download);download.setOnClickListener(v->saveAttachment(aid,filename,mime));if(mime.startsWith("audio/")){TextView play=label("▶  Воспроизвести",16,PURPLE,true);play.setPadding(0,dp(8),0,dp(5));bubble.addView(play);play.setOnClickListener(v->playAudio(aid));}}JSONArray reactions=msg.optJSONArray("reactions");if(reactions!=null&&reactions.length()>0){StringBuilder emojis=new StringBuilder();for(int ri=0;ri<reactions.length();ri++){JSONObject rx=reactions.optJSONObject(ri);if(rx!=null)emojis.append(rx.optString("emoji")).append(" ").append(rx.optInt("count")).append("  ");}TextView reaction=label(emojis.toString().trim(),14,PURPLE,true);bubble.addView(reaction);}
                 TextView stamp=label((msg.optLong("edited")>0?"изм. ":"")+DateFormat.format("HH:mm",new Date(created*1000L)).toString()+(mine?(msg.optBoolean("read")?"  ✓✓":"  ✓"):""),11,mine?PURPLE:MUTED,false);stamp.setGravity(Gravity.RIGHT);LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(-1,-2);tp.topMargin=dp(3);bubble.addView(stamp,tp);LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-2,-2);bp.gravity=mine?Gravity.RIGHT:Gravity.LEFT;bp.bottomMargin=dp(5);history.addView(bubble,bp);View.OnLongClickListener actions=v->{messageActions(msg,mine,peer,name,info);return true;};bubble.setOnLongClickListener(actions);body.setOnLongClickListener(actions);
             }
             if(bottom)scroll.post(()->scroll.fullScroll(View.FOCUS_DOWN));
@@ -430,6 +438,23 @@ public class MainActivity extends Activity {
             runOnUiThread(()->{if(!isDestroyed()&&token.equals(session))notice(code==603?"Файл сохранён":"Готово");});
         }catch(Exception e){runOnUiThread(()->{if(!isDestroyed()&&token.equals(session))notice("Не удалось выполнить операцию. Лимит файла — 8 МБ.");});}});
     }
+    void discardRecording(){if(recorder!=null){try{recorder.stop();}catch(Exception ignored){}try{recorder.release();}catch(Exception ignored){}recorder=null;}if(recording!=null){recording.delete();recording=null;}}
+    void recordVoice(String peer,String name){
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},704);return;}
+        discardRecording();
+        try{recording=File.createTempFile("voice-",".m4a",getCacheDir());recorder=new MediaRecorder();recorder.setAudioSource(MediaRecorder.AudioSource.MIC);recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);recorder.setAudioEncodingBitRate(64000);recorder.setAudioSamplingRate(44100);recorder.setMaxDuration(60000);recorder.setOutputFile(recording.getAbsolutePath());recorder.prepare();recorder.start();
+            android.app.AlertDialog dialog=new android.app.AlertDialog.Builder(this).setTitle("Запись голосового").setMessage("Запись до 60 секунд. Нажмите «Отправить», когда закончите.").setNegativeButton("Отмена",(d,w)->discardRecording()).setPositiveButton("Отправить",(d,w)->sendVoice(peer,name)).create();dialog.setOnCancelListener(d->discardRecording());recorder.setOnInfoListener((mr,what,extra)->{if(what==MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION){if(dialog.isShowing())dialog.dismiss();sendVoice(peer,name);}});dialog.show();
+        }catch(Exception e){discardRecording();notice("Не удалось начать запись");}
+    }
+    void sendVoice(String peer,String name){
+        if(recorder==null||recording==null)return;File file=recording;recording=null;
+        try{recorder.stop();}catch(Exception e){file.delete();notice("Слишком короткая запись");return;}finally{recorder.release();recorder=null;}
+        String token=session;int current=page;mediaNetwork.execute(()->{try{byte[] bytes=readBytes(new FileInputStream(file),8*1024*1024);binary("POST","/v1/attachments?recipient="+Uri.encode(peer)+"&name="+Uri.encode("Голосовое.m4a")+"&mime=audio%2Fmp4",bytes,token);runOnUiThread(()->{if(!isDestroyed()&&page==current&&token.equals(session))showChat(peer,name);});}catch(Exception e){runOnUiThread(()->{if(!isDestroyed())notice("Не удалось отправить голосовое");});}finally{file.delete();}});
+    }
+    void stopAudio(){if(player!=null){try{player.release();}catch(Exception ignored){}player=null;}if(playback!=null){playback.delete();playback=null;}}
+    void playAudio(String id){
+        stopAudio();String token=session;int current=page;mediaNetwork.execute(()->{File file=null;try{byte[] raw=binary("GET","/v1/media/"+id,null,token);file=File.createTempFile("audio-",".tmp",getCacheDir());try(FileOutputStream out=new FileOutputStream(file)){out.write(raw);}File ready=file;runOnUiThread(()->{if(isDestroyed()||page!=current||!token.equals(session)||!foreground){ready.delete();return;}try{stopAudio();playback=ready;player=new MediaPlayer();player.setDataSource(ready.getAbsolutePath());player.setOnCompletionListener(p->stopAudio());player.setOnErrorListener((p,w,e)->{stopAudio();notice("Не удалось воспроизвести");return true;});player.setOnPreparedListener(p->{if(player==p)p.start();});player.prepareAsync();}catch(Exception e){stopAudio();notice("Не удалось воспроизвести");}});}catch(Exception e){if(file!=null)file.delete();runOnUiThread(()->{if(!isDestroyed())notice("Не удалось загрузить запись");});}});
+    }
     void showStories(){
         LinearLayout layout=pageLayout();LinearLayout bar=toolbar(layout,"Истории",null,()->showAccount());line(layout,0);TextView info=label("",13,MUTED,false);layout.addView(info);
         bar.addView(icon("edit","Новая история",()->{EditText input=new EditText(this);input.setHint("Что нового?");input.setFilters(new InputFilter[]{new InputFilter.LengthFilter(280)});new android.app.AlertDialog.Builder(this).setTitle("История на 24 часа").setMessage("Видна пользователям, с которыми вы переписывались.").setView(input).setNegativeButton("Отмена",null).setPositiveButton("Опубликовать",(d,w)->{String v=input.getText().toString().trim();if(!v.isEmpty())call("POST","/v1/stories",data("text",v),x->showStories(),info,null);}).show();}),new LinearLayout.LayoutParams(dp(48),dp(56)));
@@ -495,7 +520,7 @@ public class MainActivity extends Activity {
         }).show();
     }
     @Override protected void onResume(){super.onResume();foreground=true;}
-    @Override protected void onPause(){foreground=false;super.onPause();}
+    @Override protected void onPause(){foreground=false;if(recorder!=null)discardRecording();stopAudio();super.onPause();}
     @Override public void onBackPressed(){if(session!=null){showAccount();}else super.onBackPressed();}
     static class ApiError extends IOException{int status;ApiError(int s){status=s;}}
     JSONObject request(String method,String path,JSONObject body,String token)throws Exception{
@@ -512,5 +537,5 @@ public class MainActivity extends Activity {
             }
         }finally{conn.disconnect();}
     }
-    @Override protected void onDestroy(){timer.removeCallbacksAndMessages(null);network.shutdownNow();mediaNetwork.shutdownNow();super.onDestroy();}
+    @Override protected void onDestroy(){timer.removeCallbacksAndMessages(null);network.shutdownNow();mediaNetwork.shutdownNow();discardRecording();stopAudio();super.onDestroy();}
 }
