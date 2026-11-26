@@ -156,10 +156,10 @@ class MessagingTest(unittest.TestCase):
                     self.assertEqual(client.get("/v1/gift-art/"+pepe["asset"]).status_code,200)
                     import gzip,json
                     art=json.loads(gzip.decompress(client.get("/v1/gift-art/"+pepe["asset"]).content))
-                    self.assertIn("Soft plush edition v2",art["nm"])
+                    self.assertIn("Heart plush edition v3",art["nm"])
                     self.assertEqual((art["w"],art["h"],art["op"]),(512,512,90))
                     with server.db() as db:
-                        db.execute("DELETE FROM catalog_migrations WHERE name='plush-pepe-art-v2'")
+                        db.execute("DELETE FROM catalog_migrations WHERE name='plush-pepe-art-v3'")
                         db.execute("UPDATE catalog_gifts SET asset='',price=501,issued=3 WHERE kind='plush-pepe'")
                         server.seed_catalog(db)
                         after=db.execute("SELECT asset,price,issued FROM catalog_gifts WHERE kind='plush-pepe'").fetchone()
