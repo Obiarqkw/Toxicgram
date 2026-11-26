@@ -131,6 +131,10 @@ public class ImageLocation {
     }
 
     public static ImageLocation getForPhoto(TLRPC.PhotoSize photoSize, TLRPC.Photo photo) {
+        if (org.telegram.tgnet.ToxicgramRpc.ENABLED && photo != null) {
+            String path = org.telegram.tgnet.ToxicgramRpc.avatarPath(UserConfig.selectedAccount, photo.id);
+            if (path != null) return getForPath(path);
+        }
         if (photoSize instanceof TLRPC.TL_photoStrippedSize || photoSize instanceof TLRPC.TL_photoPathSize) {
             ImageLocation imageLocation = new ImageLocation();
             imageLocation.photoSize = photoSize;
@@ -171,6 +175,10 @@ public class ImageLocation {
     }
 
     public static ImageLocation getForUser(int currentAccount, TLRPC.User user, int type) {
+        if (org.telegram.tgnet.ToxicgramRpc.ENABLED && user != null && user.photo != null && (type == TYPE_SMALL || type == TYPE_BIG)) {
+            String path = org.telegram.tgnet.ToxicgramRpc.avatarPath(currentAccount, user.photo.photo_id);
+            if (path != null) return getForPath(path);
+        }
         if (user == null || user.photo == null) {
             return null;
         }
