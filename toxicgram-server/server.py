@@ -34,7 +34,36 @@ def init():
         CREATE TABLE IF NOT EXISTS hidden_messages (owner TEXT NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY(owner,message_id));
         CREATE TABLE IF NOT EXISTS read_state (owner TEXT NOT NULL, peer TEXT NOT NULL, last_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner,peer));
         CREATE TABLE IF NOT EXISTS message_edits (message_id INTEGER PRIMARY KEY, edited INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS phone_aliases (number TEXT PRIMARY KEY, phone TEXT UNIQUE NOT NULL);
+        CREATE TABLE IF NOT EXISTS profile_details (number TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE, bio TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS reactions (message_id INTEGER NOT NULL, owner TEXT NOT NULL, emoji TEXT NOT NULL, PRIMARY KEY(message_id,owner));
+        CREATE TABLE IF NOT EXISTS blocks (owner TEXT NOT NULL, peer TEXT NOT NULL, PRIMARY KEY(owner,peer));
         """)
+
+def phone_for(n, prefix=None):
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT phone FROM phone_aliases WHERE number=?",(n,)).fetchone()
+        if row and (prefix is None or row["phone"].startswith(prefix+"000")):
+            c.commit()
+            return row["phone"]
+        prefix=prefix or "+388"
+        if prefix not in ("+7","+1","+388"):
+            raise ValueError("Unsupported virtual prefix")
+        while True:
+            phone=prefix+"000"+f"{secrets.randbelow(10000000):07d}"
+            if not c.execute("SELECT 1 FROM phone_aliases WHERE phone=?",(phone,)).fetchone():
+                break
+        c.execute("INSERT INTO phone_aliases VALUES (?,?) ON CONFLICT(number) DO UPDATE SET phone=excluded.phone",(n,phone))
+        c.commit()
+        return phone
+
+def public_profile(n):
+    phone=phone_for(n)
+    with db() as c:
+        row=c.execute("SELECT name FROM profiles WHERE number=?",(n,)).fetchone()
+        details=c.execute("SELECT username,bio FROM profile_details WHERE number=?",(n,)).fetchone()
+    return {"number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
 
 def digest(s):
     return hmac.new(PEPPER.encode(), s.encode(), hashlib.sha256).hexdigest()
@@ -107,11 +136,18 @@ def poll(stop):
                 if chat.get("type")!="private" or not sender.get("id"):
                     continue
                 cmd=m.get("text","").strip().split(maxsplit=1)
-                if cmd and cmd[0].split("@")[0] in ("/start","/code"):
+                if cmd and cmd[0].split("@")[0] in ("/start","/code","/number"):
+                    prefix=None
+                    if cmd[0].split("@")[0]=="/number":
+                        if len(cmd)!=2 or cmd[1] not in ("+7","+1","+388"):
+                            api("sendMessage",{"chat_id":chat["id"],"text":"Выберите виртуальный префикс: /number +7, /number +1 или /number +388. Это внутренние номера, не SIM-карты."})
+                            continue
+                        prefix=cmd[1]
                     result=issue(sender["id"])
                     if result:
                         n,code=result
-                        reply=f"Toxicgram\nВаш виртуальный номер: {n}\nКод Toxicgram: {code}\nДействует 5 минут. Не пересылайте код. Для нового кода: /code"
+                        phone=phone_for(n,prefix)
+                        reply=f"Toxicgram\nВаш виртуальный номер: {phone}\nКод Toxicgram: {code}\nДействует 5 минут. Не пересылайте код.\nТолько для Toxicgram, не настоящий телефон.\nПрефикс: /number +7, /number +1, /number +388.\nСтарый ID: {n}"
                     else:
                         reply="Подождите 30 секунд перед запросом нового кода."
                 else:
@@ -145,14 +181,17 @@ def health():
 def verify(body:Login,request:Request):
     if not allow("ip:"+(request.client.host if request.client else "unknown")):
         raise HTTPException(429,"Too many requests")
-    n=body.number.strip().upper()
+    try:
+        n=normalize_number(body.number)
+    except HTTPException:
+        raise HTTPException(401,"Invalid or expired credentials")
     code=body.code.strip().replace(" ","")
-    if not re.fullmatch(r"TG-[0-9]{4}-[0-9]{4}",n) or not re.fullmatch(r"[0-9]{6}",code):
+    if not re.fullmatch(r"[0-9]{6}",code):
         raise HTTPException(401,"Invalid or expired credentials")
     token=consume(n,code)
     if not token:
         raise HTTPException(401,"Invalid or expired credentials")
-    return {"access_token":token,"token_type":"bearer","expires_in":TTL,"number":n}
+    return {"access_token":token,"token_type":"bearer","expires_in":TTL,"number":n,"phone":phone_for(n)}
 
 def session(request):
     scheme,_,token=request.headers.get("Authorization","").partition(" ")
@@ -167,7 +206,7 @@ def session(request):
 
 @app.get("/v1/me")
 def me(request:Request):
-    return {"number":session(request)[1]}
+    return public_profile(session(request)[1])
 
 @app.post("/v1/auth/logout")
 def logout(request:Request):
@@ -178,16 +217,27 @@ def logout(request:Request):
 
 class ProfileUpdate(BaseModel):
     name: str = Field(min_length=1,max_length=64)
+    username: str | None = Field(default=None,max_length=32)
+    bio: str | None = Field(default=None,max_length=160)
 
 class MessageCreate(BaseModel):
     recipient: str = Field(max_length=32)
     text: str = Field(min_length=1,max_length=4000)
 
 def normalize_number(value):
-    value=value.strip().upper()
-    if not re.fullmatch(r"TG-[0-9]{4}-[0-9]{4}",value):
-        raise HTTPException(400,"Invalid Toxicgram number")
-    return value
+    value=value.strip()
+    if re.fullmatch(r"TG-[0-9]{4}-[0-9]{4}",value.upper()):
+        return value.upper()
+    with db() as c:
+        if value.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,32}",value):
+            row=c.execute("SELECT number FROM profile_details WHERE username=? COLLATE NOCASE",(value[1:],)).fetchone()
+        else:
+            compact=re.sub(r"[\s()-]","",value)
+            if not re.fullmatch(r"\+(?:7|1|388)000[0-9]{7}",compact):
+                raise HTTPException(400,"Invalid Toxicgram number")
+            row=c.execute("SELECT number FROM phone_aliases WHERE phone=?",(compact,)).fetchone()
+    if not row: raise HTTPException(404,"Account not found")
+    return row["number"]
 
 def require_peer(c, number):
     if not c.execute("SELECT 1 FROM accounts WHERE number=?",(number,)).fetchone():
@@ -196,9 +246,7 @@ def require_peer(c, number):
 @app.get("/v1/profile")
 def profile(request:Request):
     _,n=session(request)
-    with db() as c:
-        row=c.execute("SELECT name FROM profiles WHERE number=?",(n,)).fetchone()
-    return {"number":n,"name":row["name"] if row else n}
+    return public_profile(n)
 
 @app.put("/v1/profile")
 def update_profile(body:ProfileUpdate,request:Request):
@@ -207,8 +255,21 @@ def update_profile(body:ProfileUpdate,request:Request):
     if not name:
         raise HTTPException(400,"Empty name")
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
         c.execute("INSERT INTO profiles VALUES (?,?) ON CONFLICT(number) DO UPDATE SET name=excluded.name",(n,name))
-    return {"number":n,"name":name}
+        c.execute("INSERT OR IGNORE INTO profile_details(number) VALUES (?)",(n,))
+        if body.username is not None:
+            username=body.username.strip().lstrip("@").lower()
+            if username and not re.fullmatch(r"[a-z0-9_]{5,32}",username):
+                raise HTTPException(400,"Invalid username")
+            try:
+                c.execute("UPDATE profile_details SET username=? WHERE number=?",(username or None,n))
+            except sqlite3.IntegrityError:
+                raise HTTPException(409,"Username taken")
+        if body.bio is not None:
+            c.execute("UPDATE profile_details SET bio=? WHERE number=?",(body.bio.strip(),n))
+        c.commit()
+    return public_profile(n)
 
 @app.get("/v1/users/{number}")
 def lookup(number:str,request:Request):
@@ -218,8 +279,8 @@ def lookup(number:str,request:Request):
     peer=normalize_number(number)
     with db() as c:
         require_peer(c,peer)
-        row=c.execute("SELECT name FROM profiles WHERE number=?",(peer,)).fetchone()
-    return {"number":peer,"name":row["name"] if row else peer}
+        pass
+    return public_profile(peer)
 
 @app.get("/v1/chats")
 def chats(request:Request):
@@ -235,7 +296,13 @@ def chats(request:Request):
         LEFT JOIN chat_settings s ON s.owner=? AND s.peer=r.peer LEFT JOIN read_state rs ON rs.owner=? AND rs.peer=r.peer
         ORDER BY pinned DESC,r.id DESC LIMIT 100
         """,(n,n,n,n,n,n,n)).fetchall()
-    return {"chats":[dict(row) for row in rows]}
+    result=[]
+    for row in rows:
+        item=dict(row)
+        item["phone"]=phone_for(item["number"])
+        if item["name"]==item["number"]: item["name"]=item["phone"]
+        result.append(item)
+    return {"chats":result}
 
 @app.get("/v1/chats/{number}/messages")
 def history(number:str,request:Request,after:int=0,before:int=0):
@@ -253,7 +320,13 @@ def history(number:str,request:Request,after:int=0,before:int=0):
             rows=list(reversed(c.execute(base+" AND id<? ORDER BY id DESC LIMIT 100",args+(before,)).fetchall()))
         else:
             rows=list(reversed(c.execute(base+" ORDER BY id DESC LIMIT 100",args).fetchall()))
-    return {"messages":[dict(row) for row in rows]}
+        result=[]
+        for row in rows:
+            item=dict(row)
+            item["reactions"]=[dict(x) for x in c.execute("SELECT emoji,COUNT(*) AS count FROM reactions WHERE message_id=? GROUP BY emoji",(item["id"],))]
+            item["read"]=bool(c.execute("SELECT 1 FROM read_state WHERE owner=? AND peer=? AND last_id>=?",(item["recipient"],item["sender"],item["id"])).fetchone()) or item["recipient"]==item["sender"]
+            result.append(item)
+    return {"messages":result}
 
 @app.post("/v1/messages")
 def send(body:MessageCreate,request:Request):
@@ -267,6 +340,8 @@ def send(body:MessageCreate,request:Request):
     now=int(time.time())
     with db() as c:
         require_peer(c,peer)
+        if c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone():
+            raise HTTPException(403,"Messaging unavailable")
         cur=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,value,now))
         mid=cur.lastrowid
     return {"id":mid,"sender":n,"recipient":peer,"text":value,"created":now}
@@ -312,6 +387,7 @@ def delete_message(mid:int,request:Request,everyone:bool=False):
             c.execute("DELETE FROM messages WHERE id=?",(mid,))
             c.execute("DELETE FROM hidden_messages WHERE message_id=?",(mid,))
             c.execute("DELETE FROM message_edits WHERE message_id=?",(mid,))
+            c.execute("DELETE FROM reactions WHERE message_id=?",(mid,))
         else:
             c.execute("INSERT OR IGNORE INTO hidden_messages VALUES (?,?)",(n,mid))
         c.commit()
@@ -338,4 +414,36 @@ def mark_read(number:str,body:MarkRead,request:Request):
         require_peer(c,peer)
         last=c.execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE sender=? AND recipient=? AND id<=?",(peer,n,body.last_id)).fetchone()[0]
         c.execute("INSERT INTO read_state VALUES (?,?,?) ON CONFLICT(owner,peer) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)",(n,peer,last))
+    return {"ok":True}
+
+class Reaction(BaseModel):
+    emoji: str = Field(max_length=16)
+
+@app.put("/v1/messages/{mid}/reaction")
+def react(mid:int, body:Reaction, request:Request):
+    _,n=session(request)
+    if body.emoji not in ("","👍","❤️","🔥","😂","😢","👎"):
+        raise HTTPException(400,"Unsupported reaction")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        own_message(c,n,mid)
+        if body.emoji:
+            c.execute("INSERT INTO reactions VALUES (?,?,?) ON CONFLICT(message_id,owner) DO UPDATE SET emoji=excluded.emoji",(mid,n,body.emoji))
+        else:
+            c.execute("DELETE FROM reactions WHERE message_id=? AND owner=?",(mid,n))
+        c.commit()
+    return {"ok":True}
+
+class BlockUpdate(BaseModel):
+    blocked: bool
+
+@app.put("/v1/users/{number}/block")
+def block(number:str,body:BlockUpdate,request:Request):
+    _,n=session(request)
+    peer=normalize_number(number)
+    if peer==n: raise HTTPException(400,"Cannot block yourself")
+    with db() as c:
+        require_peer(c,peer)
+        if body.blocked: c.execute("INSERT OR IGNORE INTO blocks VALUES (?,?)",(n,peer))
+        else: c.execute("DELETE FROM blocks WHERE owner=? AND peer=?",(n,peer))
     return {"ok":True}
