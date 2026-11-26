@@ -73,6 +73,12 @@ public class ImageLocation {
         if (document == null) {
             return null;
         }
+        String localGift = org.telegram.tgnet.ToxicgramRpc.giftAnimationPath(document.id);
+        if (localGift != null) {
+            ImageLocation local = getForPath(localGift);
+            local.imageType = FileLoader.IMAGE_TYPE_LOTTIE;
+            return local;
+        }
         ImageLocation imageLocation = new ImageLocation();
         imageLocation.document = document;
         imageLocation.key = document.key;
