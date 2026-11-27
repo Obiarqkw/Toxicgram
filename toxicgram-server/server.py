@@ -1086,6 +1086,12 @@ def seed_catalog(c):
         asset=hashlib.sha256(data).hexdigest()
         c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
         c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("bananchik","Бананчик","🕯️",15,0,"common",0,asset))
+    charger=Path(__file__).with_name("tecno_charger.json")
+    if charger.is_file() and not c.execute("SELECT 1 FROM catalog_gifts WHERE kind='tecno-charger'").fetchone():
+        data=gzip.compress(charger.read_bytes(),mtime=0)
+        asset=hashlib.sha256(data).hexdigest()
+        c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
+        c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("tecno-charger","Зарядка TECNO","🔌",100,0,"common",0,asset))
     c.commit()
 
 def catalog_item(row):
