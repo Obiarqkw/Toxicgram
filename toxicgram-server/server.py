@@ -1246,6 +1246,19 @@ def send_gift(body:GiftSend,request:Request):
         c.execute("INSERT INTO gift_numbers VALUES (?,?)",(gid,item["issued"]+1))
         c.execute("INSERT INTO gift_details(gift_id,visible,anonymous,message) VALUES (?,?,?,?)",(gid,0,int(body.anonymous),body.message.strip()))
         if body.request_id: c.execute("INSERT INTO gift_orders VALUES (?,?,?)",(n,body.request_id,gid))
+        # Gift and its chat receipt commit together; retries return above.
+        title=item["name"]
+        note=body.message.strip()
+        now=int(time.time())
+        if n==peer:
+            receipts=[(n,n,f"🎁 Вы приобрели подарок «{title}» за {item['price']} ⭐.")]
+        elif body.anonymous:
+            receipts=[(n,n,f"🎁 Вы отправили анонимный подарок «{title}»."),(peer,peer,f"🎁 Вы получили анонимный подарок «{title}».")]
+        else:
+            receipts=[(n,peer,f"🎁 Подарок «{title}»")]
+        for sender,recipient,text in receipts:
+            if note: text+="\n"+note
+            c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(sender,recipient,text,now))
         c.commit()
     return {"serial":serial}
 

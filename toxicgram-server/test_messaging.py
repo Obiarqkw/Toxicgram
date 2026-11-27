@@ -116,6 +116,19 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(first.status_code,200)
                 self.assertEqual(first.json(),second.json())
                 self.assertEqual(client.get("/v1/gifts",headers=ha).json()["balance"],830)
+                chat=client.get("/v1/chats/"+a+"/messages",headers=hb).json()["messages"]
+                self.assertEqual(len(chat),1)
+                self.assertIn("🎁",chat[0]["text"])
+                anonymous=client.get("/v1/chats/"+b+"/messages",headers=hb).json()["messages"]
+                self.assertEqual(len(anonymous),1)
+                self.assertIn("анонимный",anonymous[0]["text"])
+                self.assertIn("Hello",anonymous[0]["text"])
+                self_order={"recipient":a,"kind":"heart","request_id":"self-purchase"}
+                self.assertEqual(client.post("/v1/gifts",headers=ha,json=self_order).status_code,200)
+                self.assertEqual(client.post("/v1/gifts",headers=ha,json=self_order).status_code,200)
+                receipts=client.get("/v1/chats/"+a+"/messages",headers=ha).json()["messages"]
+                self.assertEqual(sum("приобрели" in m["text"] for m in receipts),1)
+
                 own=client.get("/v1/users/"+b+"/gifts",headers=hb).json()["received"]
                 self.assertEqual(len(own),2)
                 self.assertNotIn("sender",own[0])
@@ -427,9 +440,10 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(client.get("/v1/media/"+msg["attachment"],headers=hb).content,voice)
                 self.assertEqual(client.get("/v1/media/"+msg["attachment"],headers=hc).status_code,404)
                 sync=client.get("/v1/sync",headers=hb).json()
-                self.assertEqual(len(sync["messages"]),1)
-                self.assertEqual(sync["messages"][0]["attachment"]["kind"],"voice")
-                self.assertEqual(sync["messages"][0]["attachment"]["duration"],3)
+                self.assertEqual(len(sync["messages"]),2)
+                self.assertIn("🎁",sync["messages"][0]["text"])
+                self.assertEqual(sync["messages"][1]["attachment"]["kind"],"voice")
+                self.assertEqual(sync["messages"][1]["attachment"]["duration"],3)
                 self.assertEqual(client.post("/v1/attachments",headers=ha,params={**params,"request_id":"124"},content=b"invalid").status_code,400)
                 video=bytes([0,0,0,24])+b"ftypmp42"+bytes(80)
                 v=client.post("/v1/attachments",headers=ha,params={"recipient":b,"name":"video.mp4","mime":"video/mp4","kind":"round","duration":5,"width":360,"height":360,"request_id":"125"},content=video)
