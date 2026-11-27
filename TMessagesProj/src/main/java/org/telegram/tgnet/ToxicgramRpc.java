@@ -109,7 +109,7 @@ public final class ToxicgramRpc {
                 }
             }
             for(int i=0;i<incoming.length();i++){
-                TLRPC.TL_message m=message(a,incoming.getJSONObject(i),self);
+                TLRPC.Message m=message(a,incoming.getJSONObject(i),self);
                 // The conversation can already have been loaded from history.
                 if(MessagesStorage.getInstance(a).getMessage(m.peer_id.user_id,m.id)!=null)continue;
                 TL_update.TL_updateNewMessage event=new TL_update.TL_updateNewMessage();event.message=m;events.add(event);
@@ -296,7 +296,30 @@ public final class ToxicgramRpc {
     private static TLRPC.TL_peerUser peerObject(String number){
         TLRPC.TL_peerUser p=new TLRPC.TL_peerUser();p.user_id=userId(number);return p;
     }
-    private static TLRPC.TL_message message(int a,JSONObject data,String self)throws Exception{
+    private static TLRPC.Message message(int a,JSONObject data,String self)throws Exception{
+        JSONObject receipt=data.optJSONObject("gift");
+        if(receipt!=null){
+            try{
+                TLRPC.TL_messageService service=new TLRPC.TL_messageService();
+                service.id=Math.toIntExact(data.getLong("id"));service.date=data.getInt("created");
+                service.out=self.equals(data.optString("sender"));
+                service.peer_id=peerObject(service.out?data.getString("recipient"):data.getString("sender"));
+                service.from_id=peerObject(data.getString("sender"));
+                service.flags=256|(service.out?2:0);
+                TLRPC.TL_messageActionStarGift action=new TLRPC.TL_messageActionStarGift();
+                action.gift=gift(receipt);
+                action.convert_stars=0;
+                action.saved=receipt.optInt("visible",0)!=0;
+                action.forceIn=true;
+                String note=receipt.optString("message","");
+                if(!note.isEmpty()){
+                    action.message=new TLRPC.TL_textWithEntities();
+                    action.message.text=note;
+                }
+                service.action=action;
+                return service;
+            }catch(Exception ignored){/* Preserve readable receipt if artwork is unavailable. */}
+        }
         TLRPC.TL_message m=new TLRPC.TL_message();
         m.id=Math.toIntExact(data.getLong("id"));m.date=data.getInt("created");
         m.message=data.optString("text","");m.out=self.equals(data.optString("sender"));
