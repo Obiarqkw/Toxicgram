@@ -200,7 +200,7 @@ def consume(n,code):
         c.commit()
         return token
 
-def allow(key):
+def allow(key,maximum=30):
     w = int(time.time())//60
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -208,7 +208,7 @@ def allow(key):
         c.execute("INSERT INTO limits VALUES (?,?,1) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN window=excluded.window THEN count+1 ELSE 1 END,window=excluded.window", (key,w))
         count = c.execute("SELECT count FROM limits WHERE key=?", (key,)).fetchone()[0]
         c.commit()
-        return count<=30
+        return count<=maximum
 
 def api(method,payload):
     req=urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/{method}",data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"})
@@ -520,7 +520,7 @@ def users_search(request:Request,q:str):
 @app.get("/v1/users/{number}")
 def lookup(number:str,request:Request):
     _,n=session(request)
-    if not allow("lookup:"+n):
+    if not allow("profile-read:"+n,180):
         raise HTTPException(429,"Too many requests")
     peer=normalize_number(number)
     with db() as c:
