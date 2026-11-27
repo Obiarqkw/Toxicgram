@@ -176,6 +176,11 @@ class MessagingTest(unittest.TestCase):
                     for kind,entry in manifest.items():
                         item=next(g for g in data["catalog"] if g["kind"]==kind)
                         self.assertEqual(item["asset"],hashlib.sha256(base64.b64decode(entry["tgs"])).hexdigest())
+                        if "catalog" in entry:
+                            for field in ("name","price","supply","rarity"):
+                                self.assertEqual(item[field],entry["catalog"][field])
+                            self.assertEqual(item["remaining"],item["supply"])
+
                     with server.db() as db:
                         db.execute("DELETE FROM catalog_migrations WHERE name='original-tgs-v1:plush-pepe'")
                         db.execute("UPDATE catalog_gifts SET asset='',price=501,issued=3 WHERE kind='plush-pepe'")

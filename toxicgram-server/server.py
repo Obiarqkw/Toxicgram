@@ -914,7 +914,10 @@ def seed_catalog(c):
             if c.execute("SELECT 1 FROM catalog_migrations WHERE name=?",(migration,)).fetchone():
                 continue
             if not c.execute("SELECT 1 FROM catalog_gifts WHERE kind=?",(kind,)).fetchone():
-                continue
+                spec=entry.get("catalog")
+                if not spec: continue
+                c.execute("INSERT INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled) VALUES (?,?,?,?,?,?,?)",
+                          (kind,spec["name"],spec["emoji"],spec["price"],spec["supply"],spec["rarity"],0))
             data=base64.b64decode(entry["tgs"],validate=True)
             if len(data)>256*1024:
                 raise ValueError("Oversized bundled gift")
