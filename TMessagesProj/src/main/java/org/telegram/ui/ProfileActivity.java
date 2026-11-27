@@ -11675,9 +11675,9 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
             setCollectibleGiftStatus(user.emoji_status instanceof TLRPC.TL_emojiStatusCollectible ? (TLRPC.TL_emojiStatusCollectible) user.emoji_status : null);
 
 
-            final ImageLocation imageLocation = ImageLocation.getForUserOrChat(user, ImageLocation.TYPE_BIG);
-            final ImageLocation thumbLocation = ImageLocation.getForUserOrChat(user, ImageLocation.TYPE_SMALL);
-            final ImageLocation videoThumbLocation = ImageLocation.getForUserOrChat(user, ImageLocation.TYPE_VIDEO_BIG);
+            final ImageLocation imageLocation = ImageLocation.getForUserOrChat(currentAccount, user, ImageLocation.TYPE_BIG);
+            final ImageLocation thumbLocation = ImageLocation.getForUserOrChat(currentAccount, user, ImageLocation.TYPE_SMALL);
+            final ImageLocation videoThumbLocation = ImageLocation.getForUserOrChat(currentAccount, user, ImageLocation.TYPE_VIDEO_BIG);
             VectorAvatarThumbDrawable vectorAvatarThumbDrawable = null;
             TLRPC.VideoSize vectorAvatar = null;
             if (userInfo != null) {
@@ -11707,7 +11707,10 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
             }
             if (imageLocation != null && (prevLoadedImageLocation == null || imageLocation.photoId != prevLoadedImageLocation.photoId)) {
                 prevLoadedImageLocation = imageLocation;
-                getFileLoader().loadFile(imageLocation, user, null, FileLoader.PRIORITY_LOW, 1);
+                // Toxicgram avatars are local files; ImageReceiver loads them directly.
+                if (imageLocation.path == null) {
+                    getFileLoader().loadFile(imageLocation, user, null, FileLoader.PRIORITY_LOW, 1);
+                }
             }
 
             CharSequence newString = UserObject.getUserName(user);
