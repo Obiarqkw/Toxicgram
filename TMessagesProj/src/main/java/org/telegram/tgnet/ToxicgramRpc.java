@@ -39,6 +39,27 @@ public final class ToxicgramRpc {
     private static final ExecutorService IO=Executors.newSingleThreadExecutor();
     private static final ExecutorService PROBES=Executors.newSingleThreadExecutor();
     private static final java.util.Set<Integer> checking=java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<Integer,Boolean>());
+    public interface PremiumCallback { void done(JSONObject data, String error); }
+    public static void premiumRequest(int account, int months, boolean cancel, PremiumCallback callback){
+        IO.execute(()->{
+            JSONObject result=null;String error=null;
+            try{
+                String path=cancel?"/v1/premium/cancel":"/v1/premium";
+                JSONObject body=months>0?new JSONObject().put("months",months).put("request_id",java.util.UUID.randomUUID().toString()):null;
+                result=http(months>0||cancel?"POST":"GET",path,body,token(account));
+                TLRPC.TL_user updated=user(account,http("GET","/v1/me",null,token(account)),true);
+                org.telegram.messenger.AndroidUtilities.runOnUIThread(()->{
+                    MessagesController.getInstance(account).putUser(updated,false);
+                    UserConfig.getInstance(account).setCurrentUser(updated);
+                    UserConfig.getInstance(account).saveConfig(false);
+                    org.telegram.messenger.NotificationCenter.getInstance(account).postNotificationName(org.telegram.messenger.NotificationCenter.updateInterfaces,0);
+                });
+            }catch(ApiError e){error=e.code==409?"Недостаточно звёзд или подписка уже активна":"Не удалось выполнить запрос";}
+            catch(Exception e){error="Не удалось подключиться к серверу";}
+            final JSONObject data=result;final String failure=error;
+            org.telegram.messenger.AndroidUtilities.runOnUIThread(()->callback.done(data,failure));
+        });
+    }
     public static void probe(int account){
         if(!checking.add(account))return;
         PROBES.execute(()->{
@@ -271,8 +292,10 @@ public final class ToxicgramRpc {
         u.id=userId(p.getString("number"));u.first_name=p.optString("first_name",p.optString("name",p.optString("phone","Toxicgram")));u.last_name=p.optString("last_name","");
         u.phone=p.optString("phone","").replace("+","");u.username=p.optString("username","");
         self=p.getString("number").equals(prefs(a).getString("number","")) || self;
+        u.premium=p.optBoolean("premium",false);
         u.self=self;u.flags=2|4|16|(u.username.isEmpty()?0:8)|(self?1024:0);
         u.access_hash=u.id;u.flags|=1;
+        if(u.premium)u.flags|=268435456;
         if(p.has("last_seen")){u.status=presence(p);u.flags|=64;}
         String asset=p.optString("avatar","");
         if(asset.matches("[a-f0-9]{32}")){
