@@ -974,6 +974,64 @@ def get_media(mid:str,request:Request):
 CATALOG={"heart":{"name":"Сердце","emoji":"💝","price":50},"bear":{"name":"Мишка","emoji":"🧸","price":100},"rose":{"name":"Роза","emoji":"🌹","price":75},"star":{"name":"Звезда","emoji":"🌟","price":150},"crystal":{"name":"Кристалл","emoji":"💎","price":250}}
 CATALOG.update({"present":{"name":"Подарок","emoji":"🎁","price":100},"cake":{"name":"Торт","emoji":"🎂","price":120}})
 GIFT_ART={"heart":"email_setup_heart","star":"star_reaction","crystal":"wallet_diamond_blue","present":"gift","cake":"cake"}
+def memorial_animation(encoded):
+    # Convert the bundled, quantized memorial illustration into vector-only Lottie.
+    import zlib
+    from collections import defaultdict
+    if hashlib.sha256(encoded.encode()).hexdigest()!="e3c9d7956124b6262594afb62e380944ab4c05b8a98d5d9c322a74811657e92b":
+        raise ValueError("Unexpected memorial image checksum")
+    raw=zlib.decompress(base64.b64decode(encoded,validate=True))
+    n,count=raw[:2]
+    palette=raw[2:2+count*3]
+    pixels=raw[2+count*3:]
+    if (n,count)!=(96,24) or len(pixels)!=n*n or max(pixels)>=count:
+        raise ValueError("Invalid memorial image")
+    edges=[defaultdict(set) for _ in range(count)]
+    for y in range(n):
+        for x in range(n):
+            color=pixels[y*n+x]
+            e=edges[color]
+            if y==0 or pixels[(y-1)*n+x]!=color: e[x,y].add((x+1,y))
+            if x==n-1 or pixels[y*n+x+1]!=color: e[x+1,y].add((x+1,y+1))
+            if y==n-1 or pixels[(y+1)*n+x]!=color: e[x+1,y+1].add((x,y+1))
+            if x==0 or pixels[y*n+x-1]!=color: e[x,y+1].add((x,y))
+    def prop(v): return {"a":0,"k":v}
+    def transform(): return {"ty":"tr","p":prop([0,0]),"a":prop([0,0]),"s":prop([100,100]),"r":prop(0),"o":prop(100),"sk":prop(0),"sa":prop(0)}
+    shapes=[]
+    directions=[(1,0),(0,1),(-1,0),(0,-1)]
+    for color,e in enumerate(edges):
+        paths=[]
+        while e:
+            start=min(e)
+            prev=start
+            cur=min(e[start])
+            e[start].remove(cur)
+            if not e[start]: del e[start]
+            vertices=[start]
+            while cur!=start:
+                vertices.append(cur)
+                direction=directions.index((cur[0]-prev[0],cur[1]-prev[1]))
+                options=e[cur]
+                nxt=min(options,key=lambda p:(directions.index((p[0]-cur[0],p[1]-cur[1]))-direction-1)%4)
+                options.remove(nxt)
+                if not options: del e[cur]
+                prev,cur=cur,nxt
+            v=[]
+            for j,b in enumerate(vertices):
+                a=vertices[j-1]
+                c=vertices[(j+1)%len(vertices)]
+                if (b[0]-a[0],b[1]-a[1])!=(c[0]-b[0],c[1]-b[1]):
+                    v.append([round(b[0]*512/n,3),round(b[1]*512/n,3)])
+            if len(v)>=3:
+                paths.append({"ty":"sh","ks":prop({"i":[[0,0]]*len(v),"o":[[0,0]]*len(v),"v":v,"c":True})})
+        if paths:
+            rgba=[v/255 for v in palette[color*3:color*3+3]]+[1]
+            shapes.append({"ty":"gr","it":paths+[{"ty":"fl","c":prop(rgba),"o":prop(100),"r":2},transform()]})
+    animation={"v":"5.7.4","fr":30,"ip":0,"op":30,"w":512,"h":512,"nm":"Bananchik memorial","ddd":0,"assets":[],"layers":[{"ddd":0,"ind":1,"ty":4,"nm":"Memorial artwork","sr":1,"ks":{"o":prop(100),"r":prop(0),"p":prop([0,0,0]),"a":prop([0,0,0]),"s":prop([100,100,100])},"ao":0,"shapes":shapes,"ip":0,"op":30,"st":0,"bm":0}]}
+    data=gzip.compress(json.dumps(animation,separators=(",",":")).encode(),mtime=0)
+    if len(data)>256*1024: raise ValueError("Memorial artwork exceeds TGS size limit")
+    return data
+
 def seed_catalog(c):
     # Stable IDs 1..7 preserve legacy Android gift identifiers.
     c.execute("BEGIN IMMEDIATE")
@@ -1018,6 +1076,12 @@ def seed_catalog(c):
             c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
             c.execute("UPDATE catalog_gifts SET asset=? WHERE kind=?",(asset,kind))
             c.execute("INSERT INTO catalog_migrations VALUES (?)",(migration,))
+    memorial=Path(__file__).with_name("bananchik_palette.b64")
+    if memorial.is_file() and not c.execute("SELECT 1 FROM catalog_gifts WHERE kind='bananchik'").fetchone():
+        data=memorial_animation(memorial.read_text().strip())
+        asset=hashlib.sha256(data).hexdigest()
+        c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
+        c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("bananchik","Бананчик","🕯️",15,0,"common",0,asset))
     c.commit()
 
 def catalog_item(row):

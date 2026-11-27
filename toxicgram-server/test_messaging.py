@@ -164,6 +164,9 @@ class MessagingTest(unittest.TestCase):
                     h={"Authorization":"Bearer "+client.post("/v1/auth/verify",json={"number":n,"code":code}).json()["access_token"]}
                     self.assertEqual(client.get("/v1/admin/catalog",headers=h).status_code,401)
                     data=client.get("/v1/admin/catalog",headers=admin).json()
+                    memorial=next(g for g in data["catalog"] if g["kind"]=="bananchik")
+                    self.assertEqual((memorial["name"],memorial["price"],memorial["active"]),("Бананчик",15,1))
+                    self.assertEqual(client.get("/v1/gift-art/"+memorial["asset"]).status_code,200)
                     pepe=next(g for g in data["catalog"] if g["kind"]=="plush-pepe")
                     self.assertEqual((pepe["price"],pepe["supply"],pepe["rarity"],pepe["upgrade_enabled"],pepe["active"]),(500,1000,"legendary",1,1))
                     self.assertEqual(client.get("/v1/gift-art/"+pepe["asset"]).status_code,200)
