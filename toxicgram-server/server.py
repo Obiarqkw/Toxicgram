@@ -902,6 +902,30 @@ def seed_catalog(c):
         if applied:
             c.execute("UPDATE catalog_gifts SET asset=? WHERE kind=?", (asset,"plush-pepe"))
             c.execute("INSERT INTO admin_audit(action,kind,created) VALUES (?,?,?)",("artwork.redesign.v3","plush-pepe",int(time.time())))
+    # Import bundled upstream animations once; never overwrite later admin edits.
+    manifest=Path(__file__).with_name("original_gifts.json")
+    if manifest.exists():
+        c.execute("CREATE TABLE IF NOT EXISTS catalog_migrations (name TEXT PRIMARY KEY)")
+        for kind, entry in json.loads(manifest.read_text()).items():
+            migration="original-tgs-v1:"+kind
+            if c.execute("SELECT 1 FROM catalog_migrations WHERE name=?",(migration,)).fetchone():
+                continue
+            if not c.execute("SELECT 1 FROM catalog_gifts WHERE kind=?",(kind,)).fetchone():
+                continue
+            data=base64.b64decode(entry["tgs"],validate=True)
+            if len(data)>256*1024:
+                raise ValueError("Oversized bundled gift")
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as stream:
+                raw=stream.read(4*1024*1024+1)
+            if len(raw)>4*1024*1024:
+                raise ValueError("Oversized bundled animation")
+            animation=json.loads(raw)
+            if not isinstance(animation,dict) or animation.get("w")!=512 or animation.get("h")!=512 or not isinstance(animation.get("layers"),list):
+                raise ValueError("Invalid bundled animation")
+            asset=hashlib.sha256(data).hexdigest()
+            c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
+            c.execute("UPDATE catalog_gifts SET asset=? WHERE kind=?",(asset,kind))
+            c.execute("INSERT INTO catalog_migrations VALUES (?)",(migration,))
     c.commit()
 
 def catalog_item(row):

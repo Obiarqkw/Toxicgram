@@ -156,10 +156,15 @@ class MessagingTest(unittest.TestCase):
                     self.assertEqual(client.get("/v1/gift-art/"+pepe["asset"]).status_code,200)
                     import gzip,json
                     art=json.loads(gzip.decompress(client.get("/v1/gift-art/"+pepe["asset"]).content))
-                    self.assertIn("Heart plush edition v3",art["nm"])
-                    self.assertEqual((art["w"],art["h"],art["op"]),(512,512,90))
+                    self.assertTrue(art["layers"])
+                    self.assertEqual((art["w"],art["h"]),(512,512))
+                    import base64,hashlib
+                    manifest=json.loads(server.Path(server.__file__).with_name("original_gifts.json").read_text())
+                    for kind,entry in manifest.items():
+                        item=next(g for g in data["catalog"] if g["kind"]==kind)
+                        self.assertEqual(item["asset"],hashlib.sha256(base64.b64decode(entry["tgs"])).hexdigest())
                     with server.db() as db:
-                        db.execute("DELETE FROM catalog_migrations WHERE name='plush-pepe-art-v3'")
+                        db.execute("DELETE FROM catalog_migrations WHERE name='original-tgs-v1:plush-pepe'")
                         db.execute("UPDATE catalog_gifts SET asset='',price=501,issued=3 WHERE kind='plush-pepe'")
                         server.seed_catalog(db)
                         after=db.execute("SELECT asset,price,issued FROM catalog_gifts WHERE kind='plush-pepe'").fetchone()
