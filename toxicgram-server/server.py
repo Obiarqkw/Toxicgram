@@ -72,6 +72,7 @@ def init():
         CREATE TABLE IF NOT EXISTS catalog_gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT UNIQUE NOT NULL, name TEXT NOT NULL, emoji TEXT NOT NULL DEFAULT '', price INTEGER NOT NULL, supply INTEGER NOT NULL DEFAULT 0, issued INTEGER NOT NULL DEFAULT 0, rarity TEXT NOT NULL DEFAULT 'common', upgrade_enabled INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, art TEXT NOT NULL DEFAULT '', asset TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS gift_art (id TEXT PRIMARY KEY, data BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS gift_numbers (gift_id INTEGER PRIMARY KEY, num INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS user_verifications (number TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, symbol INTEGER NOT NULL, color INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS account_freezes (number TEXT PRIMARY KEY, reason TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS admin_user_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, reason TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS admin_user_action_number ON admin_user_actions(number,id);
@@ -112,7 +113,8 @@ def public_profile(n,own=False):
         names=c.execute("SELECT first_name,last_name FROM profile_names WHERE number=?",(n,)).fetchone()
         gift_count=c.execute("SELECT COUNT(*) FROM gifts g LEFT JOIN gift_details d ON g.id=d.gift_id WHERE g.recipient=? AND (?=1 OR d.visible=1)",(n,int(own))).fetchone()[0]
         premium=c.execute("SELECT 1 FROM premium_subscriptions WHERE number=? AND paid_until>?",(n,int(time.time()))).fetchone() is not None
-    return {"premium":premium,"first_name":names["first_name"] if names else (row["name"] if row else phone),"last_name":names["last_name"] if names else "","gift_count":gift_count,"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
+        verification=c.execute("SELECT title,description,symbol,color FROM user_verifications WHERE number=?",(n,)).fetchone()
+    return {"verification":dict(verification) if verification else None,"premium":premium,"first_name":names["first_name"] if names else (row["name"] if row else phone),"last_name":names["last_name"] if names else "","gift_count":gift_count,"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
 
 def digest(s):
     return hmac.new(PEPPER.encode(), s.encode(), hashlib.sha256).hexdigest()
@@ -553,6 +555,8 @@ def chats(request:Request):
         item["first_name"]=p["first_name"]
         item["last_name"]=p["last_name"]
         item["username"]=p["username"]
+        item["premium"]=p["premium"]
+        item["verification"]=p["verification"]
         with db() as c:
             seen=visible_presence(c,n,item["number"])
         item.update(seen)
@@ -1129,6 +1133,7 @@ SELECT a.number, COALESCE(p.name,ph.phone,a.number) AS name,
        COALESCE(w.balance,1000) AS balance,
        CASE WHEN f.number IS NULL THEN 0 ELSE 1 END AS frozen,
        COALESCE(f.reason,'') AS freeze_reason,COALESCE(f.created,0) AS frozen_at,
+       COALESCE(v.title,'') AS verification_title, COALESCE(v.description,'') AS verification_description, COALESCE(v.symbol,0) AS verification_symbol, COALESCE(v.color,0) AS verification_color,
        (SELECT COUNT(*) FROM gifts g WHERE g.recipient=a.number) AS gift_count
 FROM accounts a LEFT JOIN profiles p ON p.number=a.number
 LEFT JOIN phone_aliases ph ON ph.number=a.number
@@ -1136,6 +1141,7 @@ LEFT JOIN profile_details pd ON pd.number=a.number
 LEFT JOIN avatars av ON av.number=a.number
 LEFT JOIN wallets w ON w.number=a.number
 LEFT JOIN account_freezes f ON f.number=a.number
+LEFT JOIN user_verifications v ON v.number=a.number
 """
 
 @app.get("/v1/admin/users")
@@ -1201,6 +1207,28 @@ def admin_finish(c,number,action,body,sig,result):
     c.execute("INSERT INTO admin_user_requests VALUES (?,?,?)",(body.request_id,sig,json.dumps(result,ensure_ascii=False)))
     c.commit()
     return result
+
+class AdminVerification(AdminAction):
+    enabled:bool
+    title:str=Field(default="",max_length=64)
+    description:str=Field(default="",max_length=250)
+    symbol:int=Field(default=0,ge=0,le=5)
+    color:int=Field(default=0,ge=0,le=5)
+
+@app.post("/v1/admin/users/{number}/verification")
+def admin_verification(number:str,body:AdminVerification,request:Request):
+    admin_auth(request)
+    if not body.reason.strip() or (body.enabled and not body.title.strip()): raise HTTPException(400,"Specify verification title and reason")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        require_peer(c,number)
+        sig,prev=admin_replay(c,number,"verification.set",body)
+        if prev is not None: return prev
+        if body.enabled:
+            c.execute("INSERT OR REPLACE INTO user_verifications VALUES (?,?,?,?,?)",(number,body.title.strip(),body.description.strip(),body.symbol,body.color))
+        else:
+            c.execute("DELETE FROM user_verifications WHERE number=?",(number,))
+        return admin_finish(c,number,"verification.set",body,sig,{"ok":True,"enabled":body.enabled,"title":body.title.strip(),"symbol":body.symbol,"color":body.color})
 
 @app.post("/v1/admin/users/{number}/stars")
 def admin_stars(number:str,body:AdminStars,request:Request):
