@@ -461,8 +461,17 @@ public final class ToxicgramRpc {
     private static TLObject gifts(int a,TLObject req)throws Exception{
         if(req instanceof TL_stars.getStarGifts){
             JSONArray catalog=http("GET","/v1/gifts?dynamic=true",null,token(a)).getJSONArray("catalog");
-            TL_stars.TL_starGifts result=new TL_stars.TL_starGifts();result.hash=2;
-            for(int i=0;i<catalog.length();i++){JSONObject row=catalog.getJSONObject(i);if(row.optInt("active",1)!=0&&(!row.optString("art","").isEmpty()||!row.optString("asset","").isEmpty())){try{result.gifts.add(gift(row));}catch(Exception ignored){/* One bad asset must not hide the whole catalog. */}}}
+            TL_stars.TL_starGifts result=new TL_stars.TL_starGifts();result.hash=catalog.toString().hashCode();
+            int eligible=0;
+            for(int i=0;i<catalog.length();i++){
+                JSONObject row=catalog.getJSONObject(i);
+                if(row.optInt("active",1)!=0&&(!row.optString("art","").isEmpty()||!row.optString("asset","").isEmpty())){
+                    eligible++;
+                    try{result.gifts.add(gift(row));}catch(Exception e){org.telegram.messenger.FileLog.e(e);}
+                }
+            }
+            // Preserve the last successful catalog instead of publishing an empty or partial list.
+            if(result.gifts.size()!=eligible)throw new IOException("Gift catalog artwork incomplete");
             return result;
         }
         if(req instanceof TL_stars.TL_payments_getStarsStatus){
