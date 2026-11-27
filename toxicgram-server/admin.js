@@ -22,12 +22,12 @@ $("user-search").onsubmit=e=>{e.preventDefault();loadUsers()};
 $("user-more").onclick=()=>loadUsers(true);
 $("user-close").onclick=()=>{if(userBusy)return;userEpoch++;selectedUser=null;pendingAction=null;$("user-detail").hidden=true};
 function renderUser(data){
- const u=data.user;selectedUser=u;$("user-info").replaceChildren(el("h2",u.name),el("p",u.number+" · "+(u.username?"@"+u.username:"Без username")),el("p",u.phone||"Виртуальный номер ещё не назначен"),el("p",u.bio||"Нет описания"));
+ const u=data.user;selectedUser=u;$("verify-form").reset();$("verify-title").value=u.verification_title||"";$("verify-description").value=u.verification_description||"";$("verify-symbol").value=String(u.verification_symbol||0);$("verify-color").value=String(u.verification_color||0);$("user-info").replaceChildren(el("h2",u.name),el("p",u.number+" · "+(u.username?"@"+u.username:"Без username")),el("p",u.phone||"Виртуальный номер ещё не назначен"),el("p",u.bio||"Нет описания"));
  $("user-state").replaceChildren(el("strong","⭐ "+u.balance+" · "+(u.frozen?"Аккаунт заморожен":"Аккаунт активен")),el("p",u.freeze_reason||""));
  $("freeze-submit").textContent=u.frozen?"Разморозить аккаунт":"Заморозить аккаунт";
  $("grant-kind").replaceChildren();for(const g of items){const option=el("option",g.name+(g.supply?" · осталось "+g.remaining:""));option.value=g.kind;option.disabled=!!g.supply&&g.remaining===0;$("grant-kind").append(option)}
  $("user-gifts").replaceChildren();for(const g of data.gifts){$("user-gifts").append(el("p",(g.emoji||"🎁")+" "+g.name+(g.num?" #"+g.num:"")+" · "+(g.visible?"В профиле":"Скрыт")))}if(!data.gifts.length)$("user-gifts").append(el("p","Нет подарков"));
- const labels={"stars.adjust":"Баланс","gift.grant":"Выдача подарка","account.freeze":"Заморозка","account.unfreeze":"Разморозка"};
+ const labels={"verification.set":"Верификация","stars.adjust":"Баланс","gift.grant":"Выдача подарка","account.freeze":"Заморозка","account.unfreeze":"Разморозка"};
  $("user-audit").replaceChildren();for(const a of data.audit){let detail="";try{const d=JSON.parse(a.detail);detail=a.action==="stars.adjust"?(d.delta>0?"+":"")+d.delta+" ⭐ ("+d.before+" → "+d.balance+")":a.action==="gift.grant"?d.kind+" #"+d.num:""}catch{}
  $("user-audit").append(el("p",new Date(a.created*1000).toLocaleString()+" · "+(labels[a.action]||a.action)+" "+detail+" · "+a.reason))}
  if(!data.audit.length)$("user-audit").append(el("p","Нет действий"));
@@ -53,3 +53,5 @@ async function mutate(e,action,body,description){
 $("stars-form").onsubmit=e=>{const delta=Number($("stars-amount").value)*($("stars-mode").value==="add"?1:-1);mutate(e,"stars",{delta,reason:$("stars-reason").value},(delta>0?"Начислить ":"Списать ")+Math.abs(delta)+" ⭐?")};
 $("grant-form").onsubmit=e=>mutate(e,"gift",{kind:$("grant-kind").value,reason:$("grant-reason").value},"Выдать подарок "+$("grant-kind").selectedOptions[0]?.textContent+" бесплатно?");
 $("freeze-form").onsubmit=e=>{if(!selectedUser)return;const frozen=!selectedUser.frozen;mutate(e,"freeze",{frozen,reason:$("freeze-reason").value},frozen?"Заморозить аккаунт и завершить все его сеансы?":"Разморозить аккаунт? Пользователю потребуется новый вход.")};
+
+$("verify-form").onsubmit=e=>mutate(e,"verification",{enabled:$("verify-enabled").value==="yes",title:$("verify-title").value,description:$("verify-description").value,symbol:Number($("verify-symbol").value),color:Number($("verify-color").value),reason:$("verify-reason").value},"Изменить верификацию пользователя?");
