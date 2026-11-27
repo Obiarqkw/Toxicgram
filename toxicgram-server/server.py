@@ -5,6 +5,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from fastapi.concurrency import run_in_threadpool
 import base64, binascii, gzip, io
+from datetime import datetime, timezone
+import calendar
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -60,6 +62,8 @@ def init():
         CREATE TABLE IF NOT EXISTS attachment_orders (sender TEXT NOT NULL, request_id TEXT NOT NULL, message_id INTEGER NOT NULL, signature TEXT NOT NULL, PRIMARY KEY(sender,request_id));
         CREATE TABLE IF NOT EXISTS message_media (message_id INTEGER PRIMARY KEY, media_id TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS avatars (number TEXT PRIMARY KEY, media_id TEXT UNIQUE NOT NULL);
+        CREATE TABLE IF NOT EXISTS premium_subscriptions (number TEXT PRIMARY KEY, months INTEGER NOT NULL, price INTEGER NOT NULL, started INTEGER NOT NULL, paid_months INTEGER NOT NULL, paid_until INTEGER NOT NULL, renew INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS premium_orders (number TEXT NOT NULL, request_id TEXT NOT NULL, months INTEGER NOT NULL, PRIMARY KEY(number,request_id));
         CREATE TABLE IF NOT EXISTS wallets (number TEXT PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 1000);
         CREATE TABLE IF NOT EXISTS gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, created INTEGER NOT NULL, serial TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS gift_details (gift_id INTEGER PRIMARY KEY, visible INTEGER NOT NULL DEFAULT 0, anonymous INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '');
@@ -107,7 +111,8 @@ def public_profile(n,own=False):
         avatar=c.execute("SELECT media_id FROM avatars WHERE number=?",(n,)).fetchone()
         names=c.execute("SELECT first_name,last_name FROM profile_names WHERE number=?",(n,)).fetchone()
         gift_count=c.execute("SELECT COUNT(*) FROM gifts g LEFT JOIN gift_details d ON g.id=d.gift_id WHERE g.recipient=? AND (?=1 OR d.visible=1)",(n,int(own))).fetchone()[0]
-    return {"first_name":names["first_name"] if names else (row["name"] if row else phone),"last_name":names["last_name"] if names else "","gift_count":gift_count,"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
+        premium=c.execute("SELECT 1 FROM premium_subscriptions WHERE number=? AND paid_until>?",(n,int(time.time()))).fetchone() is not None
+    return {"premium":premium,"first_name":names["first_name"] if names else (row["name"] if row else phone),"last_name":names["last_name"] if names else "","gift_count":gift_count,"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
 
 def digest(s):
     return hmac.new(PEPPER.encode(), s.encode(), hashlib.sha256).hexdigest()
@@ -275,6 +280,7 @@ async def lifespan(app):
         raise RuntimeError("AUTH_SECRET must have at least 32 characters")
     init()
     stop=threading.Event()
+    threading.Thread(target=premium_worker,args=(stop,),daemon=True).start()
     if TOKEN:
         threading.Thread(target=poll,args=(stop,),daemon=True).start()
     yield
@@ -319,6 +325,86 @@ def session(request):
 @app.get("/v1/me")
 def me(request:Request):
     return public_profile(session(request)[1],own=True)
+
+PREMIUM_PLANS={1:1499,12:899,24:499}
+
+def premium_boundary(start,months):
+    d=datetime.fromtimestamp(start,timezone.utc)
+    index=d.year*12+d.month-1+months
+    year,month=divmod(index,12)
+    return int(d.replace(year=year,month=month+1,day=min(d.day,calendar.monthrange(year,month+1)[1])).timestamp())
+
+def premium_renew(c,now):
+    rows=c.execute("SELECT * FROM premium_subscriptions WHERE renew=1 AND paid_until<=?",(now,)).fetchall()
+    for row in rows:
+        n=row["number"]
+        # No retroactive charges after outages, cancellation or insufficient funds.
+        if row["paid_months"]>=row["months"] or premium_boundary(row["started"],row["paid_months"]+1)<=now or c.execute("SELECT 1 FROM account_freezes WHERE number=?",(n,)).fetchone():
+            c.execute("UPDATE premium_subscriptions SET renew=0 WHERE number=?",(n,))
+            continue
+        if not c.execute("UPDATE wallets SET balance=balance-? WHERE number=? AND balance>=?",(row["price"],n,row["price"])).rowcount:
+            c.execute("UPDATE premium_subscriptions SET renew=0 WHERE number=?",(n,))
+            continue
+        paid=row["paid_months"]+1
+        c.execute("UPDATE premium_subscriptions SET paid_months=?,paid_until=?,renew=? WHERE number=?",(paid,premium_boundary(row["started"],paid),int(paid<row["months"]),n))
+
+def premium_worker(stop):
+    while not stop.is_set():
+        try:
+            with db() as c:
+                c.execute("BEGIN IMMEDIATE")
+                premium_renew(c,int(time.time()))
+                c.commit()
+        except Exception:
+            print("Premium billing check failed",flush=True)
+        stop.wait(60)
+
+def premium_status(c,n):
+    row=c.execute("SELECT * FROM premium_subscriptions WHERE number=?",(n,)).fetchone()
+    wallet=c.execute("SELECT balance FROM wallets WHERE number=?",(n,)).fetchone()
+    result=dict(row) if row else {}
+    result.pop("number",None)
+    result["active"]=bool(row and row["paid_until"]>int(time.time()))
+    result["balance"]=wallet["balance"] if wallet else 1000
+    return result
+
+class PremiumPurchase(BaseModel):
+    months:int
+    request_id:str=Field(min_length=16,max_length=80)
+
+@app.get("/v1/premium")
+def get_premium(request:Request):
+    _,n=session(request)
+    with db() as c:
+        return premium_status(c,n)
+
+@app.post("/v1/premium")
+def buy_premium(body:PremiumPurchase,request:Request):
+    _,n=session(request)
+    price=PREMIUM_PLANS.get(body.months)
+    if price is None: raise HTTPException(400,"Invalid plan")
+    now=int(time.time())
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        prior=c.execute("SELECT months FROM premium_orders WHERE number=? AND request_id=?",(n,body.request_id)).fetchone()
+        if prior:
+            if prior["months"]!=body.months: raise HTTPException(409,"Order mismatch")
+            return premium_status(c,n)
+        if premium_status(c,n)["active"]: raise HTTPException(409,"Premium already active")
+        c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(n,))
+        if not c.execute("UPDATE wallets SET balance=balance-? WHERE number=? AND balance>=?",(price,n,price)).rowcount:
+            raise HTTPException(409,"Insufficient stars")
+        c.execute("INSERT OR REPLACE INTO premium_subscriptions VALUES (?,?,?,?,?,?,?)",(n,body.months,price,now,1,premium_boundary(now,1),int(body.months>1)))
+        c.execute("INSERT INTO premium_orders VALUES (?,?,?)",(n,body.request_id,body.months))
+        c.commit()
+        return premium_status(c,n)
+
+@app.post("/v1/premium/cancel")
+def cancel_premium(request:Request):
+    _,n=session(request)
+    with db() as c:
+        c.execute("UPDATE premium_subscriptions SET renew=0 WHERE number=?",(n,))
+        return premium_status(c,n)
 
 @app.post("/v1/auth/logout")
 def logout(request:Request):
