@@ -296,6 +296,11 @@ public final class ToxicgramRpc {
         u.self=self;u.flags=2|4|16|(u.username.isEmpty()?0:8)|(self?1024:0);
         u.access_hash=u.id;u.flags|=1;
         if(u.premium)u.flags|=268435456;
+        JSONObject verification=p.optJSONObject("verification");
+        if(verification!=null){
+            u.bot_verification_icon=920000000000000000L+verification.optInt("color")*6L+verification.optInt("symbol");
+            u.flags2|=16384;
+        }
         if(p.has("last_seen")){u.status=presence(p);u.flags|=64;}
         String asset=p.optString("avatar","");
         if(asset.matches("[a-f0-9]{32}")){
@@ -622,6 +627,15 @@ public final class ToxicgramRpc {
             TLRPC.TL_userFull full=new TLRPC.TL_userFull();full.id=userId(number);full.about=p.optString("bio","");full.flags=2;
             full.settings=new TLRPC.TL_peerSettings();full.notify_settings=new TLRPC.TL_peerNotifySettings();
             full.stargifts_count=p.optInt("gift_count",0);full.flags2|=256;
+            JSONObject verification=p.optJSONObject("verification");
+            if(verification!=null){
+                full.bot_verification=new org.telegram.tgnet.tl.TL_bots.BotVerification();
+                full.bot_verification.bot_id=0;
+                full.bot_verification.icon=920000000000000000L+verification.optInt("color")*6L+verification.optInt("symbol");
+                full.bot_verification.description=new TLRPC.TL_textWithEntities();
+                full.bot_verification.description.text=verification.optString("title")+" — "+verification.optString("description");
+                full.flags2|=131072;
+            }
             String avatar=p.optString("avatar","");if(avatar.matches("[a-f0-9]{32}")){try{full.profile_photo=avatarPhoto(a,avatar);full.flags|=4;}catch(Exception ignored){}}
             result.full_user=full;result.users.add(user(a,p,self));return result;
         }

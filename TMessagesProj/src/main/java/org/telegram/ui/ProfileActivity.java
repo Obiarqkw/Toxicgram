@@ -14184,7 +14184,11 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                             }
                             if (bot_verification != null) {
                                 sb.append("x");
-                                sb.setSpan(new AnimatedEmojiSpan(bot_verification.icon, cell.getTextView().getPaint().getFontMetricsInt()), sb.length() - 1, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                                if(org.telegram.ui.Components.ToxicVerificationDrawable.isToxic(bot_verification.icon)){
+                                    org.telegram.ui.Components.ToxicVerificationDrawable badge=new org.telegram.ui.Components.ToxicVerificationDrawable(bot_verification.icon);
+                                    badge.setBounds(0,0,dp(16),dp(16));
+                                    sb.setSpan(new android.text.style.ImageSpan(badge),sb.length()-1,sb.length(),Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                                }else sb.setSpan(new AnimatedEmojiSpan(bot_verification.icon, cell.getTextView().getPaint().getFontMetricsInt()), sb.length() - 1, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                                 sb.append(" ");
                                 SpannableString description = new SpannableString(MessageObject.formatTextWithEntities(bot_verification.description));
                                 try {
