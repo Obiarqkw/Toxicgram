@@ -614,6 +614,8 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
     private final static int enable_no_forwards = 46;
     private final static int disable_no_forwards = 47;
     private final static int send_money = 48;
+    private final static int toxic_premium_menu = 9071;
+    private final static int toxic_self_gifts = 9072;
 
     private Rect rect = new Rect();
 
@@ -2791,6 +2793,10 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     presentFragment(StatisticActivity.create(chat, false));
                 } else if (id == view_discussion) {
                     openDiscussion();
+                } else if (id == toxic_premium_menu) {
+                    showToxicPremium();
+                } else if (id == toxic_self_gifts) {
+                    showDialog(new GiftSheet(getContext(), currentAccount, getUserConfig().getClientUserId(), null, null));
                 } else if (id == gift_premium) {
                     onGiftPermiumClicked();
                 } else if (id == send_money) {
@@ -12370,6 +12376,10 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     setUsernameItem = otherItem.addSubItem(set_username, R.drawable.menu_username_change, getString(R.string.ProfileUsernameEdit));
                     linkItem = otherItem.addSubItem(copy_link_profile, R.drawable.msg_link2, getString(R.string.ProfileCopyLink));
                     updateItemsUsername();
+                }
+                if (org.telegram.tgnet.ToxicgramRpc.ENABLED) {
+                    otherItem.addSubItem(toxic_premium_menu, R.drawable.msg_settings_premium, "Toxic Premium");
+                    otherItem.addSubItem(toxic_self_gifts, R.drawable.msg_gift_premium, "Купить подарок себе");
                 }
                 selfUser = true;
             } else {
