@@ -63,6 +63,7 @@ def init():
         CREATE TABLE IF NOT EXISTS wallets (number TEXT PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 1000);
         CREATE TABLE IF NOT EXISTS gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, created INTEGER NOT NULL, serial TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS gift_details (gift_id INTEGER PRIMARY KEY, visible INTEGER NOT NULL DEFAULT 0, anonymous INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS gift_receipts (message_id INTEGER PRIMARY KEY, gift_id INTEGER NOT NULL, price INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS gift_orders (sender TEXT NOT NULL, request_id TEXT NOT NULL, gift_id INTEGER NOT NULL, PRIMARY KEY(sender,request_id));
         CREATE TABLE IF NOT EXISTS catalog_gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT UNIQUE NOT NULL, name TEXT NOT NULL, emoji TEXT NOT NULL DEFAULT '', price INTEGER NOT NULL, supply INTEGER NOT NULL DEFAULT 0, issued INTEGER NOT NULL DEFAULT 0, rarity TEXT NOT NULL DEFAULT 'common', upgrade_enabled INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, art TEXT NOT NULL DEFAULT '', asset TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS gift_art (id TEXT PRIMARY KEY, data BLOB NOT NULL);
@@ -515,6 +516,7 @@ def sync_messages(request:Request,after:int=0):
             item=dict(row)
             attachment=c.execute("SELECT m.id,m.name,m.mime,m.size,COALESCE(d.kind,'file') AS kind,COALESCE(d.duration,0) AS duration,COALESCE(d.width,0) AS width,COALESCE(d.height,0) AS height FROM media m JOIN message_media a ON a.media_id=m.id LEFT JOIN attachment_details d ON d.media_id=m.id WHERE a.message_id=?",(item["id"],)).fetchone()
             item["attachment"]=dict(attachment) if attachment else None
+            item["gift"]=gift_receipt(c,item["id"])
             delivered.append(item)
     profiles=[]
     for peer in set(x["sender"] for x in batch):
@@ -544,6 +546,7 @@ def history(number:str,request:Request,after:int=0,before:int=0):
             item=dict(row)
             attachment=c.execute("SELECT m.id,m.name,m.mime,m.size,COALESCE(d.kind,'file') AS kind,COALESCE(d.duration,0) AS duration,COALESCE(d.width,0) AS width,COALESCE(d.height,0) AS height FROM media m JOIN message_media a ON a.media_id=m.id LEFT JOIN attachment_details d ON d.media_id=m.id WHERE a.message_id=?",(item["id"],)).fetchone()
             item["attachment"]=dict(attachment) if attachment else None
+            item["gift"]=gift_receipt(c,item["id"])
             item["reactions"]=[dict(x) for x in c.execute("SELECT emoji,COUNT(*) AS count FROM reactions WHERE message_id=? GROUP BY emoji",(item["id"],))]
             item["read"]=bool(c.execute("SELECT 1 FROM read_state WHERE owner=? AND peer=? AND last_id>=?",(item["recipient"],item["sender"],item["id"])).fetchone()) or item["recipient"]==item["sender"]
             result.append(item)
@@ -1178,6 +1181,16 @@ class GiftSend(BaseModel):
     message:str=Field(default="",max_length=250)
     expected_price:int|None=Field(default=None,ge=1)
 
+def gift_receipt(c,mid):
+    row=c.execute("""SELECT g.kind,r.price AS paid_price,d.message,d.anonymous,d.visible,cg.*
+        FROM gift_receipts r JOIN gifts g ON g.id=r.gift_id
+        JOIN gift_details d ON d.gift_id=g.id JOIN catalog_gifts cg ON cg.kind=g.kind
+        WHERE r.message_id=?""",(mid,)).fetchone()
+    if not row: return None
+    result=catalog_item(row)
+    result["price"]=row["paid_price"]
+    return result
+
 def gift_row(row,own):
     item=dict(row)
     if item.get("anonymous") or not own: item.pop("sender",None)
@@ -1258,7 +1271,8 @@ def send_gift(body:GiftSend,request:Request):
             receipts=[(n,peer,f"🎁 Подарок «{title}»")]
         for sender,recipient,text in receipts:
             if note: text+="\n"+note
-            c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(sender,recipient,text,now))
+            mid=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(sender,recipient,text,now)).lastrowid
+            c.execute("INSERT INTO gift_receipts VALUES (?,?,?)",(mid,gid,item["price"]))
         c.commit()
     return {"serial":serial}
 
