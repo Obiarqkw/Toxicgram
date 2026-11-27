@@ -688,6 +688,23 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
     private int addToContactsRow;
     private int addToGroupButtonRow;
     private int addToGroupInfoRow;
+    private void showToxicPremium() {
+        org.telegram.tgnet.ToxicgramRpc.premiumRequest(currentAccount,0,false,(data,error)->{
+            if(getParentActivity()==null)return;
+            android.app.AlertDialog.Builder d=new android.app.AlertDialog.Builder(getParentActivity()).setTitle("Toxic Premium");
+            if(error!=null){d.setMessage(error).setPositiveButton("OK",null).show();return;}
+            if(data.optBoolean("active")){
+                String until=java.text.DateFormat.getDateInstance().format(new java.util.Date(data.optLong("paid_until")*1000L));
+                d.setMessage("Premium активен до "+until+"\nБаланс: "+data.optLong("balance")+" ⭐\nОплачено месяцев: "+data.optInt("paid_months")+" / "+data.optInt("months"));
+                if(data.optInt("renew")==1)d.setNegativeButton("Отменить продление",(x,y)->new android.app.AlertDialog.Builder(getParentActivity()).setTitle("Отменить продление?").setMessage("Доступ сохранится до конца оплаченного месяца.").setNegativeButton("Назад",null).setPositiveButton("Отменить",(a,b)->org.telegram.tgnet.ToxicgramRpc.premiumRequest(currentAccount,0,true,(result,err)->{if(getParentActivity()!=null){if(err==null)showToxicPremium();else new android.app.AlertDialog.Builder(getParentActivity()).setMessage(err).setPositiveButton("OK",null).show();}})).show());
+                d.setPositiveButton("Закрыть",null).show();return;
+            }
+            final String[] labels={"1 месяц — 1499 ⭐/мес.","1 год — 899 ⭐/мес.","2 года — 499 ⭐/мес."};
+            final int[] months={1,12,24};final int[] prices={1499,899,499};
+            d.setItems(labels,(x,index)->new android.app.AlertDialog.Builder(getParentActivity()).setTitle("Подключить Toxic Premium").setMessage(labels[index]+"\nСегодня будет списано "+prices[index]+" ⭐. Оплата ежемесячно до окончания выбранного срока или отмены.\nБаланс: "+data.optLong("balance")+" ⭐").setNegativeButton("Назад",null).setPositiveButton("Подключить",(a,b)->org.telegram.tgnet.ToxicgramRpc.premiumRequest(currentAccount,months[index],false,(result,err)->{if(getParentActivity()!=null){if(err==null)showToxicPremium();else new android.app.AlertDialog.Builder(getParentActivity()).setMessage(err).setPositiveButton("OK",null).show();}})).show());
+            d.setNegativeButton("Закрыть",null).show();
+        });
+    }
     private int premiumRow;
     private int starsRow;
     private int tonRow;
@@ -4566,7 +4583,8 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
             } else if (position == setAvatarRow) {
                 onWriteButtonClick();
             } else if (position == premiumRow) {
-                presentFragment(new PremiumPreviewFragment("settings"));
+                if (org.telegram.tgnet.ToxicgramRpc.ENABLED) showToxicPremium();
+                else presentFragment(new PremiumPreviewFragment("settings"));
             } else if (position == starsRow) {
                 presentFragment(new StarsIntroActivity());
             } else if (position == tonRow) {
@@ -11015,7 +11033,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                 devicesRow = rowCount++;
                 languageRow = rowCount++;
                 devicesSectionRow = rowCount++;
-                if (!getMessagesController().premiumFeaturesBlocked()) {
+                if (org.telegram.tgnet.ToxicgramRpc.ENABLED || !getMessagesController().premiumFeaturesBlocked()) {
                     premiumRow = rowCount++;
                 }
                 if (org.telegram.tgnet.ToxicgramRpc.ENABLED || getMessagesController().starsPurchaseAvailable()) {
@@ -14052,7 +14070,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     } else if (position == addToGroupButtonRow) {
                         textCell.setTextAndIcon(LocaleController.getString(R.string.AddToGroupOrChannel), R.drawable.msg_groups_create, false);
                     } else if (position == premiumRow) {
-                        textCell.setTextAndIcon(LocaleController.getString(R.string.TelegramPremium), new AnimatedEmojiDrawable.WrapSizeDrawable(PremiumGradient.getInstance().premiumStarMenuDrawable, dp(24), dp(24)), true);
+                        textCell.setTextAndIcon(org.telegram.tgnet.ToxicgramRpc.ENABLED ? "Toxic Premium" : LocaleController.getString(R.string.TelegramPremium), new AnimatedEmojiDrawable.WrapSizeDrawable(PremiumGradient.getInstance().premiumStarMenuDrawable, dp(24), dp(24)), true);
                         textCell.setImageLeft(23);
                     } else if (position == starsRow) {
                         StarsController c = StarsController.getInstance(currentAccount);
