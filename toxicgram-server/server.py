@@ -29,6 +29,8 @@ def init():
     with db() as c:
         c.executescript("""
         PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS bot_manager (id INTEGER PRIMARY KEY CHECK(id=1), number TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS bot_manager_state (owner TEXT PRIMARY KEY, stage TEXT NOT NULL, name TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS bots (number TEXT PRIMARY KEY, owner TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS accounts (telegram_id INTEGER PRIMARY KEY, number TEXT UNIQUE NOT NULL, code_hash TEXT, expires INTEGER DEFAULT 0, issued INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS referral_codes (number TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE);
@@ -86,6 +88,7 @@ def init():
         """)
         c.execute("INSERT OR IGNORE INTO room_meta(room_id,mode) SELECT id,CASE WHEN kind='channel' THEN 'channel' ELSE 'basic' END FROM rooms ORDER BY rowid")
         seed_catalog(c)
+        seed_bot_manager(c)
 
 def phone_for(n, prefix=None):
     with db() as c:
@@ -661,6 +664,9 @@ def send(body:MessageCreate,request:Request):
             raise HTTPException(403,"Messaging unavailable")
         cur=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,value,now))
         mid=cur.lastrowid
+        manager=c.execute("SELECT 1 FROM bot_manager WHERE number=?",(peer,)).fetchone()
+    if manager:
+        manager_reply(n,peer,value)
     return {"id":mid,"sender":n,"recipient":peer,"text":value,"created":now}
 
 class EditMessage(BaseModel):
@@ -1593,9 +1599,12 @@ class BotCreate(BaseModel):
 def create_bot(body:BotCreate,request:Request):
     _,owner=session(request)
     if not allow("bot-create:"+owner,5): raise HTTPException(429,"Too many requests")
-    username=body.username.strip().lstrip("@").lower()
-    name=body.name.strip()
-    if not name or not re.fullmatch(r"[a-z0-9_]{5,32}",username) or not username.endswith("bot"):
+    return create_owned_bot(owner,body.name,body.username)
+
+def create_owned_bot(owner,name,username):
+    username=username.strip().lstrip("@").lower()
+    name=name.strip()
+    if not 1<=len(name)<=64 or not re.fullmatch(r"[a-z0-9_]{5,32}",username) or not username.endswith("bot"):
         raise HTTPException(400,"Username must end in bot")
     token=secrets.token_urlsafe(48)
     with db() as c:
@@ -1694,3 +1703,92 @@ async def bot_api(method:str,request:Request):
         return {"ok":True,"result":result}
     except HTTPException as exc: return fail(exc.status_code,str(exc.detail))
     except (ValueError,TypeError,OverflowError): return fail(400,"Invalid parameters")
+
+
+# Built-in bot manager. No external Telegram account or bot token required.
+def seed_bot_manager(c):
+    c.execute("BEGIN IMMEDIATE")
+    if c.execute("SELECT 1 FROM bot_manager WHERE id=1").fetchone():
+        c.commit()
+        return
+    while True:
+        d=f"{secrets.randbelow(100000000):08d}"
+        n=f"TG-{d[:4]}-{d[4:]}"
+        if not c.execute("SELECT 1 FROM accounts WHERE number=? UNION SELECT 1 FROM bots WHERE number=?",(n,n)).fetchone(): break
+    username="botfather"
+    while c.execute("SELECT 1 FROM profile_details WHERE username=? COLLATE NOCASE",(username,)).fetchone():
+        username="toxicgram_botfather_"+secrets.token_hex(3)
+    c.execute("INSERT INTO bots(number,owner,token_hash) VALUES (?,?,?)",(n,"",digest("bot:"+secrets.token_urlsafe(48))))
+    c.execute("INSERT INTO profiles(number,name) VALUES (?,?)",(n,"BotFather"))
+    c.execute("INSERT INTO profile_details(number,username,bio) VALUES (?,?,?)",(n,username,"Official Toxicgram bot manager"))
+    c.execute("INSERT INTO bot_manager VALUES (1,?)",(n,))
+    c.commit()
+
+@app.get("/v1/botfather")
+def botfather_profile(request:Request):
+    session(request)
+    with db() as c:
+        n=c.execute("SELECT number FROM bot_manager WHERE id=1").fetchone()["number"]
+    return public_profile(n)
+
+def manager_reply(owner,manager,value):
+    if not allow("bot-manager:"+owner,30): return
+    try:
+        reply=manager_command(owner,value)
+    except HTTPException as exc:
+        reply=str(exc.detail)
+    except (ValueError,sqlite3.IntegrityError):
+        reply="Invalid request. Try /help."
+    with db() as c:
+        c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(manager,owner,reply,int(time.time())))
+
+def manager_command(owner,value):
+    command,_,args=value.strip().partition(" ")
+    command=command.lower()
+    args=args.strip()
+    help_text=("BotFather — Toxicgram\n/newbot — create a bot\n/mybots — list your bots\n"
+               "/token @username — issue a new token\n/revoke @username — invalidate token\n"
+               "/setname @username New name\n/setdescription @username Description\n/cancel — cancel")
+    with db() as c:
+        if command in ("/start","/help","/cancel"):
+            c.execute("DELETE FROM bot_manager_state WHERE owner=?",(owner,))
+            return help_text if command!="/cancel" else "Cancelled."
+        if command=="/newbot":
+            c.execute("INSERT INTO bot_manager_state(owner,stage,name) VALUES (?,'name','') ON CONFLICT(owner) DO UPDATE SET stage='name',name=''",(owner,))
+            return "Send the display name of your new bot."
+        if command=="/mybots":
+            rows=c.execute("SELECT p.name,d.username FROM bots b JOIN profiles p ON p.number=b.number JOIN profile_details d ON d.number=b.number WHERE b.owner=? ORDER BY d.username",(owner,)).fetchall()
+            return "\n".join(f"{x['name']} — @{x['username']}" for x in rows) or "No bots yet. Use /newbot."
+        if command in ("/token","/revoke","/setname","/setdescription"):
+            username,_,new_value=args.partition(" ")
+            c.execute("BEGIN IMMEDIATE")
+            row=c.execute("SELECT b.number FROM bots b JOIN profile_details d ON d.number=b.number WHERE b.owner=? AND d.username=? COLLATE NOCASE AND b.active=1",(owner,username.lstrip("@"))).fetchone()
+            if not row: return "Bot not found. Use /mybots."
+            n=row["number"]
+            if command in ("/token","/revoke"):
+                token=secrets.token_urlsafe(48)
+                c.execute("UPDATE bots SET token_hash=? WHERE number=? AND owner=?",(digest("bot:"+token),n,owner))
+                c.commit()
+                return ("New token (previous token invalidated):\n"+token+"\nKeep it private and delete this message after copying.") if command=="/token" else "Token revoked. Use /token @username to issue another."
+            new_value=new_value.strip()
+            if not 1<=len(new_value)<=(64 if command=="/setname" else 160): return "Invalid length."
+            if command=="/setname":
+                c.execute("UPDATE profiles SET name=? WHERE number=?",(new_value,n))
+            else:
+                c.execute("UPDATE profile_details SET bio=? WHERE number=?",(new_value,n))
+            c.commit()
+            return "Saved."
+        if command.startswith("/"): return help_text
+        state=c.execute("SELECT stage,name FROM bot_manager_state WHERE owner=?",(owner,)).fetchone()
+        if not state: return help_text
+        if state["stage"]=="name":
+            if not 1<=len(value.strip())<=64: return "Send a name of 1–64 characters."
+            c.execute("UPDATE bot_manager_state SET stage='username',name=? WHERE owner=?",(value.strip(),owner))
+            return "Now send a unique username ending in bot, e.g. example_bot."
+        name=state["name"]
+    if not allow("bot-create:"+owner,5): return "Too many requests. Try again later."
+    result=create_owned_bot(owner,name,value)
+    with db() as c:
+        c.execute("DELETE FROM bot_manager_state WHERE owner=?",(owner,))
+    return ("Bot created: @"+result["username"]+"\nAPI token:\n"+result["token"]+
+            "\nKeep it private and delete this message after copying. Use Authorization: Bearer TOKEN with /bot/getMe.")
