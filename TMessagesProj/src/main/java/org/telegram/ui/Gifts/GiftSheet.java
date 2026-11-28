@@ -206,7 +206,8 @@ public class GiftSheet extends BottomSheetWithRecyclerListView implements Notifi
         fixNavigationBarKey(Theme.key_dialogGiftsBackground);
         myGifts = StarsController.getInstance(currentAccount).getProfileGiftsList(UserConfig.getInstance(currentAccount).getClientUserId());
 
-        StarsController.getInstance(currentAccount).loadStarGifts();
+        if (org.telegram.tgnet.ToxicgramRpc.ENABLED) StarsController.getInstance(currentAccount).invalidateStarGifts();
+        else StarsController.getInstance(currentAccount).loadStarGifts();
 
         final BackupImageView avatarImageView = new BackupImageView(context);
         avatarImageView.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
@@ -792,6 +793,7 @@ public class GiftSheet extends BottomSheetWithRecyclerListView implements Notifi
         } else if (id == NotificationCenter.starGiftsLoaded) {
             if (adapter != null) {
                 adapter.update(true);
+                if (org.telegram.tgnet.ToxicgramRpc.ENABLED) adapter.notifyDataSetChanged();
             }
         } else if (id == NotificationCenter.userInfoDidLoad) {
             if (!isShown()) return;
@@ -2289,11 +2291,21 @@ public class GiftSheet extends BottomSheetWithRecyclerListView implements Notifi
                     } else if (a.object instanceof TL_stars.StarGift && b.object instanceof TL_stars.StarGift) {
                         final TL_stars.StarGift ag = (TL_stars.StarGift) a.object;
                         final TL_stars.StarGift bg = (TL_stars.StarGift) b.object;
-                        return ag.id == bg.id;
+                        if (ag.id != bg.id) return false;
+                        if (org.telegram.tgnet.ToxicgramRpc.ENABLED) {
+                            TLRPC.Document ad=ag.getDocument(), bd=bg.getDocument();
+                            return ad==null || bd==null ? ad==bd : java.util.Arrays.equals(ad.file_reference,bd.file_reference) && ag.stars==bg.stars && ag.sold_out==bg.sold_out;
+                        }
+                        return true;
                     } else if (a.object instanceof TL_stars.SavedStarGift && b.object instanceof TL_stars.SavedStarGift) {
                         final TL_stars.SavedStarGift ag = (TL_stars.SavedStarGift) a.object;
                         final TL_stars.SavedStarGift bg = (TL_stars.SavedStarGift) b.object;
-                        return ag.gift.id == bg.gift.id && ag.date == bg.date && ag.saved_id == bg.saved_id;
+                        if (ag.gift.id != bg.gift.id || ag.date != bg.date || ag.saved_id != bg.saved_id) return false;
+                        if (org.telegram.tgnet.ToxicgramRpc.ENABLED) {
+                            TLRPC.Document ad=ag.gift.getDocument(), bd=bg.gift.getDocument();
+                            return ad==null || bd==null ? ad==bd : java.util.Arrays.equals(ad.file_reference,bd.file_reference);
+                        }
+                        return true;
                     }
                 }
                 return (

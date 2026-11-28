@@ -488,7 +488,7 @@ public final class ToxicgramRpc {
         String asset=row.optString("asset","");
         if(!asset.isEmpty())downloadGiftArt(g.id,asset);
         TLRPC.TL_document d=new TLRPC.TL_document();
-        d.id=g.id;d.access_hash=g.id;d.file_reference=new byte[0];d.date=1;d.mime_type="application/x-tgsticker";d.dc_id=1;
+        d.id=g.id;d.access_hash=g.id;d.file_reference=asset.getBytes(StandardCharsets.UTF_8);d.date=1;d.mime_type="application/x-tgsticker";d.dc_id=1;
         String local=giftAnimationPath(d.id);
         d.size=local==null?0:new File(local).length();
         TLRPC.TL_documentAttributeSticker sticker=new TLRPC.TL_documentAttributeSticker();sticker.alt=row.optString("emoji","");sticker.stickerset=new TLRPC.TL_inputStickerSetEmpty();
