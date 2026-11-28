@@ -1010,7 +1010,7 @@ async def upload_room_attachment(rid:str,request:Request,name:str="file",mime:st
     if kind not in ("file","voice","round","photo","video") or not 0<=duration<=3600 or not 0<=width<=4096 or not 0<=height<=4096 or len(caption)>1024 or (request_id and not re.fullmatch(r"-?[0-9]{1,20}",request_id)):raise HTTPException(400,"Invalid attachment metadata")
     _,n=await run_in_threadpool(session,request)
     if not await run_in_threadpool(allow,"upload:"+n): raise HTTPException(429,"Too many uploads")
-    name=re.sub(r"[\\x00-\\x1f/\\\\]","_",name.strip())[:120] or "file"
+    name=re.sub(r"[\x00-\x1f/\\]","_",name.strip())[:120] or "file"
     raw=await read_limited(request,MAX_MEDIA)
     return await run_in_threadpool(put_room_attachment,n,rid,name,mime,raw,kind,duration,width,height,request_id,caption)
 
