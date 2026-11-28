@@ -135,19 +135,48 @@ public final class ToxicgramRpc {
                 if(MessagesStorage.getInstance(a).getMessage(m.peer_id.user_id,m.id)!=null)continue;
                 TL_update.TL_updateNewMessage event=new TL_update.TL_updateNewMessage();event.message=m;events.add(event);
             }
-            long next=response.getLong("cursor");boolean more=response.optBoolean("more",false);
+            java.util.ArrayList<TLRPC.Chat> roomChats=new java.util.ArrayList<>();
+            long roomCursor=prefs(a).getLong("room_sync_cursor",0);
+            long roomNext=roomCursor;boolean roomMore=false;
+            try {
+                JSONObject roomSync=http("GET","/v1/rooms/sync?after="+roomCursor,null,t);
+                java.util.HashMap<String,JSONObject> roomMap=new java.util.HashMap<>();
+                JSONArray rooms=roomSync.getJSONArray("rooms"),members=roomSync.getJSONArray("users"),posts=roomSync.getJSONArray("messages");
+                for(int i=0;i<rooms.length();i++){
+                    JSONObject row=rooms.getJSONObject(i);roomMap.put(row.getString("id"),row);roomChats.add(roomChat(row,self));
+                }
+                for(int i=0;i<members.length();i++){
+                    JSONObject row=members.getJSONObject(i);users.add(user(a,row,self.equals(row.optString("number"))));
+                }
+                for(int i=0;i<posts.length();i++){
+                    JSONObject row=posts.getJSONObject(i),room=roomMap.get(row.getString("room_id"));
+                    if(room==null)continue;
+                    TLRPC.TL_message m=roomMessage(row,room,self);
+                    long dialogId=-(ROOM_BASE+room.getLong("numeric_id"));
+                    if(MessagesStorage.getInstance(a).getMessage(dialogId,m.id)!=null)continue;
+                    if("channel".equals(room.optString("mode"))){
+                        TL_update.TL_updateNewChannelMessage event=new TL_update.TL_updateNewChannelMessage();event.message=m;events.add(event);
+                    }else{
+                        TL_update.TL_updateNewMessage event=new TL_update.TL_updateNewMessage();event.message=m;events.add(event);
+                    }
+                }
+                roomNext=roomSync.getLong("cursor");roomMore=roomSync.optBoolean("more");
+            }catch(ApiError e){if(e.code!=404)org.telegram.messenger.FileLog.e("Toxicgram room sync: "+e.code);}
+            catch(Exception e){org.telegram.messenger.FileLog.e("Toxicgram room sync: "+e.getClass().getSimpleName());}
+            final long nextRoom=roomNext;
+            long next=response.getLong("cursor");boolean more=response.optBoolean("more",false)||roomMore;
             int date=response.getInt("server_time");
             Utilities.stageQueue.postRunnable(()->{
                 try{
                     if(!p.active||!t.equals(token(a)))return;
-                    if(!MessagesController.getInstance(a).processUpdateArray(events,users,new java.util.ArrayList<TLRPC.Chat>(),true,date)){
+                    if(!MessagesController.getInstance(a).processUpdateArray(events,users,roomChats,true,date)){
                         p.readOut.clear();p.readIn.clear();scheduleSync(a,p,5);return;
                     }
                     // Persist cursor behind the storage queue after incoming messages.
                     MessagesStorage.getInstance(a).getStorageQueue().postRunnable(()->{
                         try{
                             if(p.active&&t.equals(token(a))){
-                                prefs(a).edit().putLong("sync_cursor_v1",next).commit();
+                                prefs(a).edit().putLong("sync_cursor_v1",next).putLong("room_sync_cursor",nextRoom).commit();
                                 p.failures=0;
                                 ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);
                                 scheduleSync(a,p,more?0:4);
@@ -181,7 +210,7 @@ public final class ToxicgramRpc {
         Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,key());
         byte[] encrypted=cipher.doFinal(token.getBytes(StandardCharsets.UTF_8));
         SharedPreferences.Editor editor=prefs(a).edit();
-        if(!number.equals(prefs(a).getString("number","")))editor.remove("sync_cursor_v1");
+        if(!number.equals(prefs(a).getString("number","")))editor.remove("sync_cursor_v1").remove("room_sync_cursor");
         if(!editor.putString("token",Base64.encodeToString(encrypted,Base64.NO_WRAP))
             .putString("iv",Base64.encodeToString(cipher.getIV(),Base64.NO_WRAP)).putString("number",number).commit())
             throw new IOException("Cannot persist session");
@@ -838,6 +867,7 @@ public final class ToxicgramRpc {
         }
         if(req instanceof TLRPC.TL_messages_readHistory){
             TLRPC.TL_messages_readHistory read=(TLRPC.TL_messages_readHistory)req;
+            if(isRoom(read.peer))throw new ApiError(501,"TOXICGRAM_ROOM_READ_NOT_IMPLEMENTED");
             http("PUT","/v1/chats/"+peer(a,read.peer)+"/read",new JSONObject().put("last_id",Math.max(0,read.max_id)),token(a));
             TLRPC.TL_messages_affectedMessages result=new TLRPC.TL_messages_affectedMessages();result.pts=0;result.pts_count=0;return result;
         }
