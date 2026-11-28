@@ -214,7 +214,7 @@ public final class ToxicgramRpc {
         }finally{conn.disconnect();}
     }
     private static String phone(String raw){
-        String v=raw.replaceAll("[^0-9]","");
+        String v=raw==null?"":raw.replaceAll("[^0-9]","");
         return "+"+v;
     }
     public static long userId(String number){
@@ -364,7 +364,21 @@ public final class ToxicgramRpc {
             TLObject response=null;TLRPC.TL_error error=null;
             try{response=dispatch(account,request);}
             catch(ApiError e){error=new TLRPC.TL_error();error.code=e.code;error.text=e.type;}
-            catch(Exception e){error=new TLRPC.TL_error();error.code=500;error.text="TOXICGRAM_REQUEST_FAILED";if(e instanceof IOException)probe(account);}
+            catch(Exception e){
+                error=new TLRPC.TL_error();error.code=500;error.text="TOXICGRAM_REQUEST_FAILED";
+                // Log only the exception type, never a phone number, code or token.
+                boolean auth=request instanceof TLRPC.TL_auth_sendCode || request instanceof TLRPC.TL_auth_resendCode || request instanceof TLRPC.TL_auth_signIn;
+                if(auth){
+                    if(e instanceof java.net.UnknownHostException) error.text="TOXICGRAM_DNS_ERROR";
+                    else if(e instanceof javax.net.ssl.SSLException) error.text="TOXICGRAM_TLS_ERROR";
+                    else if(e instanceof java.net.SocketTimeoutException) error.text="TOXICGRAM_TIMEOUT";
+                    else if(e instanceof java.net.ConnectException || e instanceof java.net.NoRouteToHostException) error.text="TOXICGRAM_CONNECTION_ERROR";
+                    else if(e instanceof java.security.GeneralSecurityException) error.text="TOXICGRAM_SESSION_STORAGE_ERROR";
+                    else if(e instanceof ClassCastException) error.text="TOXICGRAM_LOCAL_STATE_ERROR";
+                    org.telegram.messenger.FileLog.e("Toxicgram auth: "+e.getClass().getSimpleName());
+                }
+                if(e instanceof IOException)probe(account);
+            }
             final TLObject result=response;final TLRPC.TL_error failure=error;
             Utilities.stageQueue.postRunnable(()->{
                 if(completion!=null)completion.run(result,failure);
@@ -737,14 +751,7 @@ public final class ToxicgramRpc {
         return null;
     }
     private static TLObject dispatch(int a,TLObject req)throws Exception{
-        TLObject mediaResponse=mediaRpc(a,req);
-        if(mediaResponse!=null)return mediaResponse;
-        TLObject profileResponse=profileRpc(a,req);
-        if(profileResponse!=null)return profileResponse;
-        TLObject roomResponse=roomsRpc(a,req);
-        if(roomResponse!=null)return roomResponse;
-        TLObject giftResponse=gifts(a,req);
-        if(giftResponse!=null)return giftResponse;
+        // Authentication must not depend on cached room, gift or profile state.
         if(req instanceof TLRPC.TL_auth_sendCode || req instanceof TLRPC.TL_auth_resendCode){
             String raw=req instanceof TLRPC.TL_auth_sendCode?((TLRPC.TL_auth_sendCode)req).phone_number:((TLRPC.TL_auth_resendCode)req).phone_number;
             if(!phone(raw).matches("\\+(7|1|388)000[0-9]{7}"))throw new ApiError(400,"PHONE_NUMBER_INVALID");
@@ -766,6 +773,14 @@ public final class ToxicgramRpc {
             auth.user=user(a,profile,true);
             setForeground(a,false);store(a,t,profile.getString("number"));setForeground(a,true);ConnectionsManager.onToxicgramConnectionStateChanged(ConnectionsManager.ConnectionStateConnected,a);return auth;
         }
+        TLObject mediaResponse=mediaRpc(a,req);
+        if(mediaResponse!=null)return mediaResponse;
+        TLObject profileResponse=profileRpc(a,req);
+        if(profileResponse!=null)return profileResponse;
+        TLObject roomResponse=roomsRpc(a,req);
+        if(roomResponse!=null)return roomResponse;
+        TLObject giftResponse=gifts(a,req);
+        if(giftResponse!=null)return giftResponse;
         if(req instanceof TLRPC.TL_auth_logOut){
             http("POST","/v1/auth/logout",null,token(a));setForeground(a,false);prefs(a).edit().clear().commit();
             return new TLRPC.TL_auth_loggedOut();
