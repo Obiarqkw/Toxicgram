@@ -29,6 +29,7 @@ def init():
     with db() as c:
         c.executescript("""
         PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS bot_commands (number TEXT PRIMARY KEY, commands TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS bot_manager (id INTEGER PRIMARY KEY CHECK(id=1), number TEXT NOT NULL UNIQUE);
         CREATE TABLE IF NOT EXISTS bot_manager_state (owner TEXT PRIMARY KEY, stage TEXT NOT NULL, name TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS bots (number TEXT PRIMARY KEY, owner TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1);
@@ -120,7 +121,8 @@ def public_profile(n,own=False):
         gift_count=c.execute("SELECT COUNT(*) FROM gifts g LEFT JOIN gift_details d ON g.id=d.gift_id WHERE g.recipient=? AND (?=1 OR d.visible=1)",(n,int(own))).fetchone()[0]
         premium=c.execute("SELECT 1 FROM premium_subscriptions WHERE number=? AND paid_until>?",(n,int(time.time()))).fetchone() is not None
         verification=c.execute("SELECT title,description,symbol,color FROM user_verifications WHERE number=?",(n,)).fetchone()
-    return {"verification":dict(verification) if verification else None,"premium":premium,"first_name":names["first_name"] if names else (row["name"] if row else phone),"last_name":names["last_name"] if names else "","gift_count":gift_count,"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
+        is_bot=bool(c.execute("SELECT 1 FROM bots WHERE number=?",(n,)).fetchone())
+    return {"is_bot":is_bot,"verification":dict(verification) if verification else None,"premium":premium,"first_name":names["first_name"] if names else (row["name"] if row else phone),"last_name":names["last_name"] if names else "","gift_count":gift_count,"avatar":avatar["media_id"] if avatar else "","number":n,"phone":phone,"name":row["name"] if row else phone,"username":(details["username"] or "") if details else "","bio":details["bio"] if details else ""}
 
 def digest(s):
     return hmac.new(PEPPER.encode(), s.encode(), hashlib.sha256).hexdigest()
@@ -1658,7 +1660,10 @@ async def bot_api(method:str,request:Request):
     try:
         data=dict(request.query_params)
         if request.method=="POST":
-            raw=await read_limited(request,65536)
+            raw=bytearray()
+            async for chunk in request.stream():
+                if len(raw)+len(chunk)>MAX_MEDIA*2: return fail(413,"Request too large")
+                raw.extend(chunk)
             if raw:
                 payload=json.loads(raw)
                 if not isinstance(payload,dict): return fail(400,"Invalid JSON object")
@@ -1666,6 +1671,34 @@ async def bot_api(method:str,request:Request):
         with db() as c:
             if method=="getMe":
                 result=bot_identity(c,n)
+            elif method=="getMyCommands":
+                saved=c.execute("SELECT commands FROM bot_commands WHERE number=?",(n,)).fetchone()
+                result=json.loads(saved["commands"]) if saved else []
+            elif method in ("setMyCommands","deleteMyCommands"):
+                if request.method!="POST": return fail(405,"POST required")
+                commands=data.get("commands",[]) if method=="setMyCommands" else []
+                if not isinstance(commands,list) or len(commands)>100: return fail(400,"Invalid commands")
+                seen=set()
+                for item in commands:
+                    if not isinstance(item,dict) or not isinstance(item.get("command"),str) or not re.fullmatch(r"[a-z0-9_]{1,32}",item["command"]) or not isinstance(item.get("description"),str) or not 1<=len(item["description"])<=256 or item["command"] in seen: return fail(400,"Invalid command")
+                    seen.add(item["command"])
+                c.execute("INSERT INTO bot_commands VALUES (?,?) ON CONFLICT(number) DO UPDATE SET commands=excluded.commands",(n,json.dumps(commands,ensure_ascii=False)))
+                result=True
+            elif method in ("sendPhoto","sendVideo","sendDocument","sendVoice"):
+                if request.method!="POST": return fail(405,"POST required")
+                peer=normalize_number(str(data.get("chat_id","")))
+                require_peer(c,peer)
+                if not c.execute("SELECT 1 FROM messages WHERE sender=? AND recipient=?",(peer,n)).fetchone(): return fail(403,"User must contact bot first")
+                encoded=data.get("file_base64")
+                if not isinstance(encoded,str) or len(encoded)>MAX_MEDIA*2: return fail(400,"Invalid file")
+                raw=base64.b64decode(encoded,validate=True)
+                if not raw or len(raw)>MAX_MEDIA: return fail(413,"Invalid file size")
+                kind={"sendPhoto":"photo","sendVideo":"video","sendDocument":"file","sendVoice":"voice"}[method]
+                name=str(data.get("filename","file"))[:120].replace("/","_").replace(chr(92),"_")
+                caption=data.get("caption","")
+                if not isinstance(caption,str) or len(caption)>1024: return fail(400,"Invalid caption")
+                saved=put_attachment(n,peer,name,str(data.get("mime","")),raw,kind,caption=caption)
+                result={"message_id":saved["id"],"chat":{"id":peer,"type":"private"},"date":saved["created"],"file_id":saved["attachment"],"caption":caption}
             elif method=="getUpdates":
                 offset=max(0,int(data.get("offset",0)))
                 limit=max(1,min(100,int(data.get("limit",100))))
@@ -1693,8 +1726,15 @@ async def bot_api(method:str,request:Request):
                     if not old: return fail(404,"Message not found")
                     now=old["created"]
                     if method=="deleteMessage":
+                        c.execute("DELETE FROM attachment_details WHERE media_id IN (SELECT media_id FROM message_media WHERE message_id=?)",(mid,))
+                        c.execute("DELETE FROM media WHERE id IN (SELECT media_id FROM message_media WHERE message_id=?)",(mid,))
+                        c.execute("DELETE FROM message_media WHERE message_id=?",(mid,))
                         c.execute("DELETE FROM messages WHERE id=?",(mid,))
+                        c.execute("DELETE FROM message_edits WHERE message_id=?",(mid,))
+                        c.execute("DELETE FROM reactions WHERE message_id=?",(mid,))
+                        c.execute("DELETE FROM hidden_messages WHERE message_id=?",(mid,))
                     else:
+                        if c.execute("SELECT 1 FROM message_media WHERE message_id=?",(mid,)).fetchone(): return fail(400,"Cannot edit attachment text")
                         c.execute("UPDATE messages SET body=? WHERE id=?",(value,mid))
                         c.execute("INSERT INTO message_edits VALUES (?,?) ON CONFLICT(message_id) DO UPDATE SET edited=excluded.edited",(mid,int(time.time())))
                 result=True if method=="deleteMessage" else {"message_id":mid,"from":bot_identity(c,n),"chat":{"id":peer,"type":"private"},"date":now,"text":value}
@@ -1702,7 +1742,7 @@ async def bot_api(method:str,request:Request):
             else: return fail(404,"Unknown method")
         return {"ok":True,"result":result}
     except HTTPException as exc: return fail(exc.status_code,str(exc.detail))
-    except (ValueError,TypeError,OverflowError): return fail(400,"Invalid parameters")
+    except (ValueError,TypeError,OverflowError,binascii.Error): return fail(400,"Invalid parameters")
 
 
 # Built-in bot manager. No external Telegram account or bot token required.
