@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'toxicgram-android/**'
+      - 'toxicgram-server/**'
       - '.github/workflows/toxicgram-android.yml'
 permissions:
   contents: read
