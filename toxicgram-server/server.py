@@ -29,6 +29,10 @@ def init():
     with db() as c:
         c.executescript("""
         PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS bot_markup (message_id INTEGER PRIMARY KEY, markup TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS bot_events (id INTEGER PRIMARY KEY, bot TEXT NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS bot_invoices (message_id INTEGER PRIMARY KEY, bot TEXT NOT NULL, payer TEXT NOT NULL, owner TEXT NOT NULL, amount INTEGER NOT NULL, title TEXT NOT NULL, payload TEXT NOT NULL, paid INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS bot_menu (number TEXT PRIMARY KEY, menu TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS bot_commands (number TEXT PRIMARY KEY, commands TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS bot_manager (id INTEGER PRIMARY KEY CHECK(id=1), number TEXT NOT NULL UNIQUE);
         CREATE TABLE IF NOT EXISTS bot_manager_state (owner TEXT PRIMARY KEY, stage TEXT NOT NULL, name TEXT NOT NULL DEFAULT '');
@@ -1671,6 +1675,40 @@ async def bot_api(method:str,request:Request):
         with db() as c:
             if method=="getMe":
                 result=bot_identity(c,n)
+            elif method=="getChatMenuButton":
+                saved=c.execute("SELECT menu FROM bot_menu WHERE number=?",(n,)).fetchone()
+                result=json.loads(saved["menu"]) if saved else {"type":"default"}
+            elif method=="setChatMenuButton":
+                if request.method!="POST": return fail(405,"POST required")
+                menu=data.get("menu_button",{"type":"default"})
+                if not isinstance(menu,dict) or menu.get("type") not in ("default","commands","web_app"): return fail(400,"Invalid menu")
+                if menu["type"]=="web_app":
+                    validate_bot_markup({"inline_keyboard":[[{"text":menu.get("text"),"web_app":menu.get("web_app")}]]})
+                c.execute("INSERT INTO bot_menu VALUES (?,?) ON CONFLICT(number) DO UPDATE SET menu=excluded.menu",(n,json.dumps(menu)))
+                result=True
+            elif method=="answerCallbackQuery":
+                if request.method!="POST": return fail(405,"POST required")
+                event=c.execute("SELECT payload FROM bot_events WHERE id=? AND bot=?",(int(data.get("callback_query_id",0)),n)).fetchone()
+                if not event or "callback_query" not in json.loads(event["payload"]): return fail(404,"Callback not found")
+                result=True
+            elif method=="sendInvoice":
+                if request.method!="POST": return fail(405,"POST required")
+                peer=normalize_number(str(data.get("chat_id","")))
+                title=data.get("title")
+                payload=data.get("payload")
+                prices=data.get("prices")
+                if data.get("currency")!="XTR" or not isinstance(title,str) or not 1<=len(title)<=64 or not isinstance(payload,str) or not 1<=len(payload)<=128 or not isinstance(prices,list) or len(prices)!=1 or not isinstance(prices[0],dict): return fail(400,"Invalid invoice")
+                amount=prices[0].get("amount")
+                if type(amount)!=int or not 1<=amount<=1000000: return fail(400,"Invalid amount")
+                c.execute("BEGIN IMMEDIATE")
+                bot_peer_check(c,n,peer)
+                owner=c.execute("SELECT owner FROM bots WHERE number=?",(n,)).fetchone()["owner"]
+                if not owner or owner==peer: return fail(400,"Invalid payer")
+                now=int(time.time())
+                mid=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,title+" — "+str(amount)+" ⭐",now)).lastrowid
+                c.execute("INSERT INTO bot_invoices(message_id,bot,payer,owner,amount,title,payload) VALUES (?,?,?,?,?,?,?)",(mid,n,peer,owner,amount,title,payload))
+                c.commit()
+                result={"message_id":mid,"chat":{"id":peer,"type":"private"},"date":now,"invoice":{"title":title,"total_amount":amount,"currency":"XTR"}}
             elif method=="getMyCommands":
                 saved=c.execute("SELECT commands FROM bot_commands WHERE number=?",(n,)).fetchone()
                 result=json.loads(saved["commands"]) if saved else []
@@ -1702,9 +1740,12 @@ async def bot_api(method:str,request:Request):
             elif method=="getUpdates":
                 offset=max(0,int(data.get("offset",0)))
                 limit=max(1,min(100,int(data.get("limit",100))))
-                rows=c.execute("SELECT * FROM messages WHERE recipient=? AND id>=? ORDER BY id LIMIT ?",(n,offset,limit)).fetchall()
+                rows=c.execute("SELECT * FROM messages WHERE recipient=? AND id>=? AND NOT EXISTS(SELECT 1 FROM bot_events WHERE id=messages.id) ORDER BY id LIMIT ?",(n,offset,limit)).fetchall()
                 result=[{"update_id":x["id"],"message":{"message_id":x["id"],"from":bot_identity(c,x["sender"]),"chat":{"id":x["sender"],"type":"private"},"date":x["created"],"text":x["body"]}} for x in rows]
-            elif method in ("sendMessage","editMessageText","deleteMessage"):
+                events=c.execute("SELECT id,payload FROM bot_events WHERE bot=? AND id>=? ORDER BY id LIMIT ?",(n,offset,limit)).fetchall()
+                result.extend({"update_id":x["id"],**json.loads(x["payload"])} for x in events)
+                result=sorted(result,key=lambda x:x["update_id"])[:limit]
+            elif method in ("sendMessage","editMessageText","deleteMessage","editMessageReplyMarkup"):
                 if request.method!="POST": return fail(405,"POST required")
                 peer=normalize_number(str(data.get("chat_id","")))
                 c.execute("BEGIN IMMEDIATE")
@@ -1713,7 +1754,7 @@ async def bot_api(method:str,request:Request):
                     return fail(403,"Messaging unavailable")
                 if not c.execute("SELECT 1 FROM messages WHERE sender=? AND recipient=?",(peer,n)).fetchone():
                     return fail(403,"User must contact bot first")
-                if method!="deleteMessage":
+                if method in ("sendMessage","editMessageText"):
                     value=data.get("text")
                     if not isinstance(value,str) or not 1<=len(value.strip())<=4000: return fail(400,"Invalid text")
                     value=value.strip()
@@ -1733,11 +1774,17 @@ async def bot_api(method:str,request:Request):
                         c.execute("DELETE FROM message_edits WHERE message_id=?",(mid,))
                         c.execute("DELETE FROM reactions WHERE message_id=?",(mid,))
                         c.execute("DELETE FROM hidden_messages WHERE message_id=?",(mid,))
-                    else:
+                    elif method=="editMessageText":
                         if c.execute("SELECT 1 FROM message_media WHERE message_id=?",(mid,)).fetchone(): return fail(400,"Cannot edit attachment text")
                         c.execute("UPDATE messages SET body=? WHERE id=?",(value,mid))
                         c.execute("INSERT INTO message_edits VALUES (?,?) ON CONFLICT(message_id) DO UPDATE SET edited=excluded.edited",(mid,int(time.time())))
-                result=True if method=="deleteMessage" else {"message_id":mid,"from":bot_identity(c,n),"chat":{"id":peer,"type":"private"},"date":now,"text":value}
+                if method=="deleteMessage":
+                    c.execute("DELETE FROM bot_markup WHERE message_id=?",(mid,))
+                elif "reply_markup" in data or method=="editMessageReplyMarkup":
+                    markup=validate_bot_markup(data.get("reply_markup"))
+                    if markup is None: c.execute("DELETE FROM bot_markup WHERE message_id=?",(mid,))
+                    else: c.execute("INSERT INTO bot_markup VALUES (?,?) ON CONFLICT(message_id) DO UPDATE SET markup=excluded.markup",(mid,json.dumps(markup,ensure_ascii=False)))
+                result=True if method in ("deleteMessage","editMessageReplyMarkup") else {"message_id":mid,"from":bot_identity(c,n),"chat":{"id":peer,"type":"private"},"date":now,"text":value}
                 c.commit()
             else: return fail(404,"Unknown method")
         return {"ok":True,"result":result}
@@ -1832,3 +1879,105 @@ def manager_command(owner,value):
         c.execute("DELETE FROM bot_manager_state WHERE owner=?",(owner,))
     return ("Bot created: @"+result["username"]+"\nAPI token:\n"+result["token"]+
             "\nKeep it private and delete this message after copying. Use Authorization: Bearer TOKEN with /bot/getMe.")
+
+
+def validate_bot_markup(markup):
+    from urllib.parse import urlsplit
+    if markup is None: return None
+    if not isinstance(markup,dict): raise HTTPException(400,"Invalid keyboard")
+    rows=markup.get("inline_keyboard",markup.get("keyboard"))
+    if not isinstance(rows,list) or len(rows)>10: raise HTTPException(400,"Invalid keyboard")
+    inline="inline_keyboard" in markup
+    for row in rows:
+        if not isinstance(row,list) or not 1<=len(row)<=8: raise HTTPException(400,"Invalid keyboard row")
+        for item in row:
+            if not isinstance(item,dict) or not isinstance(item.get("text"),str) or not 1<=len(item["text"])<=128: raise HTTPException(400,"Invalid button")
+            if not inline:
+                if set(item)!={"text"}: raise HTTPException(400,"Unsupported reply button")
+                continue
+            keys=set(item)&{"callback_data","url","web_app"}
+            if len(keys)!=1: raise HTTPException(400,"Invalid button action")
+            key=next(iter(keys))
+            if key=="callback_data":
+                if not isinstance(item[key],str) or not 1<=len(item[key].encode())<=64: raise HTTPException(400,"Invalid callback")
+            else:
+                url=item[key].get("url") if key=="web_app" and isinstance(item[key],dict) else item[key]
+                if not isinstance(url,str) or len(url)>2048: raise HTTPException(400,"Invalid URL")
+                parsed=urlsplit(url)
+                if parsed.scheme!="https" or not parsed.hostname or parsed.username or parsed.password: raise HTTPException(400,"HTTPS required")
+    return markup
+
+def bot_peer_check(c,bot,peer):
+    require_peer(c,peer)
+    if c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(bot,peer,peer,bot)).fetchone(): raise HTTPException(403,"Messaging unavailable")
+    if not c.execute("SELECT 1 FROM messages WHERE sender=? AND recipient=?",(peer,bot)).fetchone(): raise HTTPException(403,"User must contact bot first")
+
+def bot_event(c,bot,user,payload):
+    # Reserve a globally ordered update id using the existing message sequence,
+    # then remove the placeholder so it never appears in a chat.
+    mid=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(user,bot,"",int(time.time()))).lastrowid
+    c.execute("DELETE FROM messages WHERE id=?",(mid,))
+    if "callback_query" in payload: payload["callback_query"]["id"]=str(mid)
+    c.execute("INSERT INTO bot_events VALUES (?,?,?)",(mid,bot,json.dumps(payload,ensure_ascii=False)))
+    return mid
+
+@app.get("/v1/bots/chat/{number}")
+def bot_chat_data(number:str,request:Request):
+    _,user=session(request)
+    bot=normalize_number(number)
+    with db() as c:
+        if not c.execute("SELECT 1 FROM bots WHERE number=? AND active=1",(bot,)).fetchone(): raise HTTPException(404,"Bot not found")
+        commands=c.execute("SELECT commands FROM bot_commands WHERE number=?",(bot,)).fetchone()
+        menu=c.execute("SELECT menu FROM bot_menu WHERE number=?",(bot,)).fetchone()
+        rows=c.execute("SELECT k.message_id,k.markup FROM bot_markup k JOIN messages m ON m.id=k.message_id WHERE m.sender=? AND m.recipient=? ORDER BY m.id DESC LIMIT 100",(bot,user)).fetchall()
+        invoices=c.execute("SELECT message_id,amount,title,paid FROM bot_invoices WHERE bot=? AND payer=? ORDER BY message_id DESC LIMIT 100",(bot,user)).fetchall()
+        return {"commands":json.loads(commands["commands"]) if commands else [],"menu":json.loads(menu["menu"]) if menu else {"type":"default"},"keyboards":[{"message_id":x["message_id"],"reply_markup":json.loads(x["markup"])} for x in rows],"invoices":[dict(x) for x in invoices]}
+
+class BotButtonPress(BaseModel):
+    row:int=Field(ge=0,le=9)
+    column:int=Field(ge=0,le=7)
+
+@app.post("/v1/bot-buttons/{mid}")
+def bot_button_press(mid:int,body:BotButtonPress,request:Request):
+    _,user=session(request)
+    if not allow("bot-button:"+user,60): raise HTTPException(429,"Too many requests")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT m.sender,k.markup FROM messages m JOIN bot_markup k ON k.message_id=m.id JOIN bots b ON b.number=m.sender WHERE m.id=? AND m.recipient=? AND b.active=1",(mid,user)).fetchone()
+        if not row: raise HTTPException(404,"Button not found")
+        bot=row["sender"]
+        bot_peer_check(c,bot,user)
+        markup=json.loads(row["markup"])
+        try: item=markup.get("inline_keyboard",markup.get("keyboard"))[body.row][body.column]
+        except IndexError: raise HTTPException(404,"Button not found")
+        if "callback_data" in item:
+            bot_event(c,bot,user,{"callback_query":{"from":bot_identity(c,user),"message":{"message_id":mid,"chat":{"id":user,"type":"private"}},"data":item["callback_data"]}})
+        elif "web_app" in item or "url" in item:
+            return {"url":item.get("url") or item["web_app"]["url"]}
+        else:
+            c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(user,bot,item["text"],int(time.time())))
+        c.commit()
+        return {"ok":True}
+
+class BotPaymentConfirm(BaseModel):
+    amount:int=Field(gt=0,le=1000000)
+
+@app.post("/v1/bot-invoices/{mid}/pay")
+def bot_pay(mid:int,body:BotPaymentConfirm,request:Request):
+    _,user=session(request)
+    if not allow("bot-pay:"+user,20): raise HTTPException(429,"Too many requests")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT i.* FROM bot_invoices i JOIN bots b ON b.number=i.bot JOIN messages m ON m.id=i.message_id WHERE i.message_id=? AND i.payer=? AND b.active=1 AND NOT EXISTS(SELECT 1 FROM account_freezes f WHERE f.number=i.owner OR f.number=i.bot)",(mid,user)).fetchone()
+        if not row: raise HTTPException(404,"Invoice not found")
+        if row["amount"]!=body.amount: raise HTTPException(409,"Amount changed")
+        if row["paid"]: return {"ok":True,"already_paid":True}
+        bot_peer_check(c,row["bot"],user)
+        c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(user,))
+        c.execute("INSERT OR IGNORE INTO wallets(number) VALUES (?)",(row["owner"],))
+        if not c.execute("UPDATE wallets SET balance=balance-? WHERE number=? AND balance>=?",(body.amount,user,body.amount)).rowcount: raise HTTPException(409,"Insufficient stars")
+        c.execute("UPDATE wallets SET balance=balance+? WHERE number=?",(body.amount,row["owner"]))
+        c.execute("UPDATE bot_invoices SET paid=1 WHERE message_id=?",(mid,))
+        bot_event(c,row["bot"],user,{"message":{"from":bot_identity(c,user),"chat":{"id":user,"type":"private"},"successful_payment":{"currency":"XTR","total_amount":body.amount,"invoice_payload":row["payload"],"toxicgram_payment_charge_id":str(mid)}}})
+        c.commit()
+    return {"ok":True,"already_paid":False}
