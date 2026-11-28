@@ -79,6 +79,15 @@ class MessagingTest(unittest.TestCase):
                     self.assertEqual(client.post(f"/v1/rooms/{rid}/messages",headers=ha,json={"text":"owner post"}).status_code,200)
                     self.assertEqual(client.post(f"/v1/rooms/{rid}/messages",headers=hb,json={"text":"member post"}).status_code,200 if kind=="group" else 403)
                     self.assertEqual(client.get(f"/v1/rooms/{rid}/messages",headers=hb).status_code,200)
+                    image=b"\xff\xd8\xff"+b"test photo"
+                    upload=client.post(f"/v1/rooms/{rid}/attachments",headers=ha,params={"kind":"photo","name":"test.jpg","request_id":"123" if kind=="group" else "124"},content=image)
+                    self.assertEqual(upload.status_code,200)
+                    asset=upload.json()["attachment"]
+                    self.assertEqual(client.get("/v1/media/"+asset,headers=hb).content,image)
+                    self.assertEqual(client.get("/v1/media/"+asset,headers=hc).status_code,404)
+                    self.assertEqual(client.post(f"/v1/rooms/{rid}/attachments",headers=ha,params={"kind":"photo","name":"test.jpg","request_id":"123" if kind=="group" else "124"},content=image).json()["id"],upload.json()["id"])
+                    self.assertEqual(client.get(f"/v1/rooms/{rid}/messages",headers=hb).json()["messages"][-1]["attachment"]["kind"],"photo")
+
                     sync=client.get("/v1/rooms/sync",headers=hb).json()
                     self.assertIn(rid,{room["id"] for room in sync["rooms"]})
                     self.assertIn("owner post",[m["text"] for m in sync["messages"] if m["room_id"]==rid])
@@ -98,6 +107,9 @@ class MessagingTest(unittest.TestCase):
                     res=client.post("/v1/auth/verify",json={"number":n,"code":code})
                     return n,{"Authorization":"Bearer "+res.json()["access_token"]}
                 a,ha=register(21);b,hb=register(22);c,hc=register(23)
+                photo=client.post("/v1/attachments",headers=ha,params={"recipient":c,"kind":"photo","name":"pic.jpg","caption":"Photo"},content=b"\xff\xd8\xfftest")
+                self.assertEqual(photo.status_code,200)
+                self.assertEqual(client.get("/v1/media/"+photo.json()["attachment"],headers=hc).status_code,200)
                 raw=b"hello attachment"
                 res=client.post("/v1/attachments",params={"recipient":b,"name":"note.txt"},headers=ha,content=raw)
                 self.assertEqual(res.status_code,200);mid=res.json()["id"];aid=res.json()["attachment"]
@@ -454,7 +466,7 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(client.get("/v1/media/"+aid,headers=hb).status_code,404)
                 # Container signatures are validated; full decoder playback is a device test.
                 voice=b"OggS"+bytes(80)
-                params={"recipient":b,"name":"voice.ogg","mime":"audio/ogg","kind":"voice","duration":3,"request_id":"123"}
+                params={"recipient":b,"name":"voice.ogg","mime":"audio/ogg","kind":"voice","duration":3,"request_id":"123" if kind=="group" else "124"}
                 result=client.post("/v1/attachments",headers=ha,params=params,content=voice)
                 self.assertEqual(result.status_code,200)
                 self.assertEqual(client.post("/v1/attachments",headers=ha,params=params,content=voice).json(),result.json())

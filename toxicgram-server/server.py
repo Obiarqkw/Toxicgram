@@ -58,6 +58,8 @@ def init():
         CREATE TABLE IF NOT EXISTS room_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS room_history ON room_messages(room_id,id);
         CREATE TABLE IF NOT EXISTS media (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, content BLOB NOT NULL, size INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS room_message_media (message_id INTEGER PRIMARY KEY, media_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS room_attachment_orders (sender TEXT NOT NULL, request_id TEXT NOT NULL, message_id INTEGER NOT NULL, signature TEXT NOT NULL, PRIMARY KEY(sender,request_id));
         CREATE TABLE IF NOT EXISTS attachment_details (media_id TEXT PRIMARY KEY, kind TEXT NOT NULL, duration INTEGER NOT NULL DEFAULT 0, width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS attachment_orders (sender TEXT NOT NULL, request_id TEXT NOT NULL, message_id INTEGER NOT NULL, signature TEXT NOT NULL, PRIMARY KEY(sender,request_id));
         CREATE TABLE IF NOT EXISTS message_media (message_id INTEGER PRIMARY KEY, media_id TEXT UNIQUE NOT NULL);
@@ -825,7 +827,9 @@ def sync_rooms(request:Request,after:int=0):
             FROM rooms r JOIN room_meta meta ON meta.room_id=r.id
             JOIN room_members member ON member.room_id=r.id WHERE member.number=?""",(n,)).fetchall()
         cursor=batch[-1]["id"] if batch else after
-    return {"messages":[dict(x) for x in batch],"rooms":[dict(x) for x in rooms],
+    with db() as c:
+        delivered=[room_media_item(c,x) for x in batch]
+    return {"messages":delivered,"rooms":[dict(x) for x in rooms],
             "users":[public_profile(peer,own=peer==n) for peer in {x["sender"] for x in batch}],
             "cursor":cursor,"more":len(rows)>100}
 
@@ -859,7 +863,8 @@ def room_history(rid:str,request:Request,before:int=0):
     with db() as c:
         get_room(c,rid,n)
         rows=c.execute("SELECT m.id,m.sender,m.body AS text,m.created,COALESCE(p.name,m.sender) AS name FROM room_messages m LEFT JOIN profiles p ON p.number=m.sender WHERE m.room_id=? AND (?=0 OR m.id<?) ORDER BY m.id DESC LIMIT 100",(rid,before,before)).fetchall()
-    return {"messages":[dict(row) for row in reversed(rows)]}
+        delivered=[room_media_item(c,row) for row in reversed(rows)]
+    return {"messages":delivered}
 
 @app.post("/v1/rooms/{rid}/messages")
 def room_send(rid:str,body:RoomText,request:Request):
@@ -887,9 +892,9 @@ def leave_room(rid:str,request:Request):
         c.commit()
     return {"ok":True}
 
-MAX_MEDIA=8*1024*1024
+MAX_MEDIA=24*1024*1024
 MAX_AVATAR=512*1024
-USER_STORAGE=32*1024*1024
+USER_STORAGE=64*1024*1024
 TOTAL_STORAGE=250*1024*1024
 
 async def read_limited(request,limit):
@@ -934,10 +939,11 @@ def put_attachment(n,peer,name,declared,raw,kind="file",duration=0,width=0,heigh
             if c.execute("SELECT 1 FROM attachment_orders WHERE sender=? AND request_id=?",(n,request_id)).fetchone():raise HTTPException(409,"Upload already used")
         mime=file_mime(raw,declared)
         if kind=="voice" and mime not in ("audio/ogg","audio/mp4","audio/mpeg"):raise HTTPException(400,"Invalid voice message")
-        if kind=="round" and mime!="video/mp4":raise HTTPException(400,"Invalid video message")
+        if kind in ("round","video") and mime!="video/mp4":raise HTTPException(400,"Invalid video message")
+        if kind=="photo" and mime not in ("image/jpeg","image/png","image/webp"):raise HTTPException(400,"Invalid photo")
         aid=store_media(c,n,name,mime,raw)
         created=int(time.time())
-        mid=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,caption if kind in ("voice","round") else caption or "📎 "+name,created)).lastrowid
+        mid=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,caption if kind in ("voice","round","photo","video") else caption or "📎 "+name,created)).lastrowid
         c.execute("INSERT INTO message_media VALUES (?,?)",(mid,aid))
         c.execute("INSERT INTO attachment_details VALUES (?,?,?,?,?)",(aid,kind,duration,width,height))
         if request_id:c.execute("INSERT INTO attachment_orders VALUES (?,?,?,?)",(n,request_id,mid,signature))
@@ -946,7 +952,7 @@ def put_attachment(n,peer,name,declared,raw,kind="file",duration=0,width=0,heigh
 
 @app.post("/v1/attachments")
 async def upload_attachment(request:Request,recipient:str,name:str="file",mime:str="application/octet-stream",kind:str="file",duration:int=0,width:int=0,height:int=0,request_id:str="",caption:str=""):
-    if kind not in ("file","voice","round") or not 0<=duration<=3600 or not 0<=width<=4096 or not 0<=height<=4096 or len(caption)>1024 or (request_id and not re.fullmatch(r"-?[0-9]{1,20}",request_id)):raise HTTPException(400,"Invalid attachment metadata")
+    if kind not in ("file","voice","round","photo","video") or not 0<=duration<=3600 or not 0<=width<=4096 or not 0<=height<=4096 or len(caption)>1024 or (request_id and not re.fullmatch(r"-?[0-9]{1,20}",request_id)):raise HTTPException(400,"Invalid attachment metadata")
     _,n=await run_in_threadpool(session,request)
     if not await run_in_threadpool(allow,"upload:"+n): raise HTTPException(429,"Too many uploads")
     peer=await run_in_threadpool(normalize_number,recipient)
@@ -964,6 +970,49 @@ def put_avatar(n,raw):
         c.execute("INSERT INTO avatars VALUES (?,?) ON CONFLICT(number) DO UPDATE SET media_id=excluded.media_id",(n,mid))
         c.commit()
     return {"avatar":mid}
+
+def room_media_item(c,row):
+    item=dict(row)
+    attachment=c.execute("""SELECT m.id,m.name,m.mime,m.size,d.kind,d.duration,d.width,d.height
+        FROM room_message_media a JOIN media m ON m.id=a.media_id
+        JOIN attachment_details d ON d.media_id=m.id WHERE a.message_id=?""",(item["id"],)).fetchone()
+    item["attachment"]=dict(attachment) if attachment else None
+    return item
+
+def put_room_attachment(n,rid,name,declared,raw,kind,duration,width,height,request_id,caption):
+    signature=hashlib.sha256(raw).hexdigest()+":"+json.dumps([rid,name,kind,duration,width,height,caption])
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        room=get_room(c,rid,n)
+        if room["kind"]=="channel" and room["owner"]!=n: raise HTTPException(403,"Only owner can post")
+        if request_id:
+            prior=c.execute("""SELECT o.signature,m.id,m.created,a.media_id FROM room_attachment_orders o
+                JOIN room_messages m ON m.id=o.message_id JOIN room_message_media a ON a.message_id=m.id
+                WHERE o.sender=? AND o.request_id=?""",(n,request_id)).fetchone()
+            if prior:
+                if prior["signature"]!=signature: raise HTTPException(409,"Upload request mismatch")
+                return {"id":prior["id"],"attachment":prior["media_id"],"created":prior["created"]}
+        mime=file_mime(raw,declared)
+        if kind=="photo" and mime not in ("image/jpeg","image/png","image/webp"): raise HTTPException(400,"Invalid photo")
+        if kind in ("video","round") and mime!="video/mp4": raise HTTPException(400,"Invalid video")
+        if kind=="voice" and mime not in ("audio/ogg","audio/mp4","audio/mpeg"): raise HTTPException(400,"Invalid voice")
+        asset=store_media(c,n,name,mime,raw)
+        now=int(time.time())
+        mid=c.execute("INSERT INTO room_messages(room_id,sender,body,created) VALUES (?,?,?,?)",(rid,n,caption if kind!="file" else caption or "📎 "+name,now)).lastrowid
+        c.execute("INSERT INTO room_message_media VALUES (?,?)",(mid,asset))
+        c.execute("INSERT INTO attachment_details VALUES (?,?,?,?,?)",(asset,kind,duration,width,height))
+        if request_id: c.execute("INSERT INTO room_attachment_orders VALUES (?,?,?,?)",(n,request_id,mid,signature))
+        c.commit()
+        return {"id":mid,"attachment":asset,"created":now}
+
+@app.post("/v1/rooms/{rid}/attachments")
+async def upload_room_attachment(rid:str,request:Request,name:str="file",mime:str="application/octet-stream",kind:str="file",duration:int=0,width:int=0,height:int=0,request_id:str="",caption:str=""):
+    if kind not in ("file","voice","round","photo","video") or not 0<=duration<=3600 or not 0<=width<=4096 or not 0<=height<=4096 or len(caption)>1024 or (request_id and not re.fullmatch(r"-?[0-9]{1,20}",request_id)):raise HTTPException(400,"Invalid attachment metadata")
+    _,n=await run_in_threadpool(session,request)
+    if not await run_in_threadpool(allow,"upload:"+n): raise HTTPException(429,"Too many uploads")
+    name=re.sub(r"[\\x00-\\x1f/\\\\]","_",name.strip())[:120] or "file"
+    raw=await read_limited(request,MAX_MEDIA)
+    return await run_in_threadpool(put_room_attachment,n,rid,name,mime,raw,kind,duration,width,height,request_id,caption)
 
 @app.put("/v1/avatar")
 async def upload_avatar(request:Request):
@@ -989,7 +1038,9 @@ def get_media(mid:str,request:Request):
         (EXISTS(SELECT 1 FROM avatars a WHERE a.media_id=m.id) OR EXISTS(
          SELECT 1 FROM message_media a JOIN messages t ON t.id=a.message_id
          WHERE a.media_id=m.id AND (t.sender=? OR t.recipient=?)
-         AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.owner=? AND h.message_id=t.id)))""",(mid,n,n,n)).fetchone()
+         AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.owner=? AND h.message_id=t.id)) OR EXISTS(
+         SELECT 1 FROM room_message_media a JOIN room_messages r ON r.id=a.message_id
+         JOIN room_members member ON member.room_id=r.room_id WHERE a.media_id=m.id AND member.number=?))""",(mid,n,n,n,n)).fetchone()
         if not row: raise HTTPException(404,"File not found")
         return Response(content=row["content"],media_type=row["mime"],headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff","Content-Disposition":"attachment"})
 
