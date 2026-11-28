@@ -1161,6 +1161,17 @@ def seed_catalog(c):
         asset=hashlib.sha256(data).hexdigest()
         c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
         c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("tecno-charger","Зарядка TECNO","🔌",100,0,"common",0,asset))
+    ai=Path(__file__).with_name("ai_hoshino.json")
+    if ai.is_file() and not c.execute("SELECT 1 FROM catalog_gifts WHERE kind='ai-hoshino'").fetchone():
+        raw=ai.read_bytes()
+        animation=json.loads(raw)
+        if animation.get("w")!=512 or animation.get("h")!=512 or not animation.get("layers") or animation.get("assets"):
+            raise ValueError("Invalid Ai Hoshino animation")
+        data=gzip.compress(raw,mtime=0)
+        if len(data)>64*1024: raise ValueError("Ai Hoshino TGS too large")
+        asset=hashlib.sha256(data).hexdigest()
+        c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
+        c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("ai-hoshino","Ai Hoshino","💖",250,0,"rare",0,asset))
     c.commit()
 
 def catalog_item(row):
