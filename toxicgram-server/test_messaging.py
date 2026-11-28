@@ -79,8 +79,14 @@ class MessagingTest(unittest.TestCase):
                     self.assertEqual(client.post(f"/v1/rooms/{rid}/messages",headers=ha,json={"text":"owner post"}).status_code,200)
                     self.assertEqual(client.post(f"/v1/rooms/{rid}/messages",headers=hb,json={"text":"member post"}).status_code,200 if kind=="group" else 403)
                     self.assertEqual(client.get(f"/v1/rooms/{rid}/messages",headers=hb).status_code,200)
+                    sync=client.get("/v1/rooms/sync",headers=hb).json()
+                    self.assertIn(rid,{room["id"] for room in sync["rooms"]})
+                    self.assertIn("owner post",[m["text"] for m in sync["messages"] if m["room_id"]==rid])
+                    self.assertEqual(client.get("/v1/rooms/sync?after="+str(sync["cursor"]),headers=hb).json()["messages"],[])
+                    self.assertNotIn(rid,{room["id"] for room in client.get("/v1/rooms/sync",headers=hc).json()["rooms"]})
                     self.assertEqual(client.delete(f"/v1/rooms/{rid}/membership",headers=hb).status_code,200)
                     self.assertEqual(client.get(f"/v1/rooms/{rid}/messages",headers=hb).status_code,404)
+                    self.assertNotIn(rid,{m["room_id"] for m in client.get("/v1/rooms/sync",headers=hb).json()["messages"]})
 
 
     def test_attachments_gifts_stories(self):

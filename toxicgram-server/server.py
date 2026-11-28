@@ -811,6 +811,24 @@ def list_rooms(request:Request):
         rows=c.execute("SELECT r.*, meta.numeric_id,meta.mode,meta.about,meta.created, (SELECT COUNT(*) FROM room_members x WHERE x.room_id=r.id) AS members FROM rooms r JOIN room_meta meta ON meta.room_id=r.id JOIN room_members m ON r.id=m.room_id WHERE m.number=? ORDER BY r.title COLLATE NOCASE LIMIT 100",(n,)).fetchall()
     return {"rooms":[dict(row) for row in rows]}
 
+@app.get("/v1/rooms/sync")
+def sync_rooms(request:Request,after:int=0):
+    _,n=session(request)
+    if after<0: raise HTTPException(400,"Invalid cursor")
+    with db() as c:
+        rows=c.execute("""SELECT m.id,m.sender,m.body AS text,m.created,m.room_id
+            FROM room_messages m JOIN room_members member ON member.room_id=m.room_id
+            WHERE member.number=? AND m.id>? ORDER BY m.id LIMIT 101""",(n,after)).fetchall()
+        batch=rows[:100]
+        rooms=c.execute("""SELECT r.*,meta.numeric_id,meta.mode,meta.about,meta.created,
+            (SELECT COUNT(*) FROM room_members x WHERE x.room_id=r.id) AS members
+            FROM rooms r JOIN room_meta meta ON meta.room_id=r.id
+            JOIN room_members member ON member.room_id=r.id WHERE member.number=?""",(n,)).fetchall()
+        cursor=batch[-1]["id"] if batch else after
+    return {"messages":[dict(x) for x in batch],"rooms":[dict(x) for x in rooms],
+            "users":[public_profile(peer,own=peer==n) for peer in {x["sender"] for x in batch}],
+            "cursor":cursor,"more":len(rows)>100}
+
 @app.get("/v1/rooms/by-id/{numeric}")
 def room_by_id(numeric:int,request:Request):
     _,n=session(request)
