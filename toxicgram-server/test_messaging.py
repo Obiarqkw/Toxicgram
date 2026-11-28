@@ -107,9 +107,6 @@ class MessagingTest(unittest.TestCase):
                     res=client.post("/v1/auth/verify",json={"number":n,"code":code})
                     return n,{"Authorization":"Bearer "+res.json()["access_token"]}
                 a,ha=register(21);b,hb=register(22);c,hc=register(23)
-                photo=client.post("/v1/attachments",headers=ha,params={"recipient":c,"kind":"photo","name":"pic.jpg","caption":"Photo"},content=b"\xff\xd8\xfftest")
-                self.assertEqual(photo.status_code,200)
-                self.assertEqual(client.get("/v1/media/"+photo.json()["attachment"],headers=hc).status_code,200)
                 raw=b"hello attachment"
                 res=client.post("/v1/attachments",params={"recipient":b,"name":"note.txt"},headers=ha,content=raw)
                 self.assertEqual(res.status_code,200);mid=res.json()["id"];aid=res.json()["attachment"]
@@ -162,6 +159,9 @@ class MessagingTest(unittest.TestCase):
                 sid=client.post("/v1/stories",headers=ha,json={"text":"story"}).json()["id"]
                 self.assertEqual(len(client.get("/v1/stories",headers=hb).json()["stories"]),1)
                 self.assertEqual(client.get("/v1/stories",headers=hc).json()["stories"],[])
+                photo=client.post("/v1/attachments",headers=ha,params={"recipient":c,"kind":"photo","name":"pic.jpg","caption":"Photo"},content=b"\xff\xd8\xfftest")
+                self.assertEqual(photo.status_code,200)
+                self.assertEqual(client.get("/v1/media/"+photo.json()["attachment"],headers=hc).status_code,200)
                 self.assertEqual(client.delete(f"/v1/stories/{sid}",headers=hb).status_code,404)
                 self.assertEqual(client.delete(f"/v1/stories/{sid}",headers=ha).status_code,200)
                 self.assertEqual(client.get("/v1/stories",headers=hb).json()["stories"],[])
@@ -466,7 +466,7 @@ class MessagingTest(unittest.TestCase):
                 self.assertEqual(client.get("/v1/media/"+aid,headers=hb).status_code,404)
                 # Container signatures are validated; full decoder playback is a device test.
                 voice=b"OggS"+bytes(80)
-                params={"recipient":b,"name":"voice.ogg","mime":"audio/ogg","kind":"voice","duration":3,"request_id":"123" if kind=="group" else "124"}
+                params={"recipient":b,"name":"voice.ogg","mime":"audio/ogg","kind":"voice","duration":3,"request_id":"123"}
                 result=client.post("/v1/attachments",headers=ha,params=params,content=voice)
                 self.assertEqual(result.status_code,200)
                 self.assertEqual(client.post("/v1/attachments",headers=ha,params=params,content=voice).json(),result.json())
