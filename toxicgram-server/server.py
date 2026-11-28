@@ -1163,7 +1163,7 @@ def seed_catalog(c):
         c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("tecno-charger","Зарядка TECNO","🔌",100,0,"common",0,asset))
     ai=Path(__file__).with_name("ai_hoshino.json")
     c.execute("CREATE TABLE IF NOT EXISTS catalog_migrations (name TEXT PRIMARY KEY)")
-    if ai.is_file() and not c.execute("SELECT 1 FROM catalog_migrations WHERE name='ai-hoshino-art-v2'").fetchone():
+    if ai.is_file() and not c.execute("SELECT 1 FROM catalog_migrations WHERE name='ai-hoshino-art-v3'").fetchone():
         raw=ai.read_bytes()
         animation=json.loads(raw)
         if animation.get("w")!=512 or animation.get("h")!=512 or not animation.get("layers") or animation.get("assets"):
@@ -1174,8 +1174,8 @@ def seed_catalog(c):
         c.execute("INSERT OR IGNORE INTO gift_art VALUES (?,?)",(asset,data))
         c.execute("INSERT OR IGNORE INTO catalog_gifts(kind,name,emoji,price,supply,rarity,upgrade_enabled,asset) VALUES (?,?,?,?,?,?,?,?)",("ai-hoshino","Ai Hoshino","💖",250,0,"rare",0,asset))
         c.execute("UPDATE catalog_gifts SET asset=? WHERE kind='ai-hoshino'",(asset,))
-        c.execute("INSERT INTO catalog_migrations VALUES (?)",("ai-hoshino-art-v2",))
-        c.execute("INSERT INTO admin_audit(action,kind,created) VALUES (?,?,?)",("artwork.redesign.v2","ai-hoshino",int(time.time())))
+        c.execute("INSERT INTO catalog_migrations VALUES (?)",("ai-hoshino-art-v3",))
+        c.execute("INSERT INTO admin_audit(action,kind,created) VALUES (?,?,?)",("artwork.redesign.v3","ai-hoshino",int(time.time())))
     c.commit()
 
 def catalog_item(row):
