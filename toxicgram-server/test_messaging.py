@@ -206,6 +206,18 @@ class MessagingTest(unittest.TestCase):
                     self.assertEqual((idol_art["w"],idol_art["h"],idol_art["fr"],idol_art["op"]),(512,512,60,180))
                     self.assertTrue(any(layer["ks"]["s"]["a"]==1 for layer in idol_art["layers"]))
                     self.assertEqual(idol_art["assets"],[])
+                    self.assertTrue(idol_art["nm"].endswith("v2"))
+                    idol_shapes=next(x["shapes"] for x in idol_art["layers"] if x["nm"]=="Ai Hoshino chibi idol")
+                    self.assertTrue(any(s["nm"]=="Animated star eye" for s in idol_shapes))
+                    self.assertTrue(any(x["ty"]=="gf" for s in idol_shapes for x in s["it"]))
+                    with server.db() as db:
+                        db.execute("UPDATE catalog_gifts SET price=251,issued=2 WHERE kind='ai-hoshino'")
+                        db.execute("DELETE FROM catalog_migrations WHERE name='ai-hoshino-art-v2'")
+                        db.commit()
+                        server.seed_catalog(db)
+                        preserved=db.execute("SELECT price,issued,asset FROM catalog_gifts WHERE kind='ai-hoshino'").fetchone()
+                        self.assertEqual(tuple(preserved),(251,2,idol["asset"]))
+
                     art=json.loads(gzip.decompress(client.get("/v1/gift-art/"+pepe["asset"]).content))
                     self.assertTrue(art["layers"])
                     self.assertEqual((art["w"],art["h"]),(512,512))
