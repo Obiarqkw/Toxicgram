@@ -29,6 +29,7 @@ def init():
     with db() as c:
         c.executescript("""
         PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS bots (number TEXT PRIMARY KEY, owner TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS accounts (telegram_id INTEGER PRIMARY KEY, number TEXT UNIQUE NOT NULL, code_hash TEXT, expires INTEGER DEFAULT 0, issued INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS referral_codes (number TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE);
         CREATE TABLE IF NOT EXISTS referrals (invitee TEXT PRIMARY KEY, inviter TEXT NOT NULL, created INTEGER NOT NULL, rewarded_at INTEGER NOT NULL DEFAULT 0, reward INTEGER NOT NULL DEFAULT 0, CHECK(invitee<>inviter));
@@ -158,7 +159,7 @@ def issue(tid,referral_code=None):
             while True:
                 d = f"{secrets.randbelow(100000000):08d}"
                 n = f"TG-{d[:4]}-{d[4:]}"
-                if not c.execute("SELECT 1 FROM accounts WHERE number=?", (n,)).fetchone():
+                if not c.execute("SELECT 1 FROM accounts WHERE number=? UNION SELECT 1 FROM bots WHERE number=?", (n,n)).fetchone():
                     break
             c.execute("INSERT INTO accounts(telegram_id,number) VALUES (?,?)", (tid,n))
             # Only the first bot start can bind an invitation. Existing accounts
@@ -442,7 +443,7 @@ def normalize_number(value):
     return row["number"]
 
 def require_peer(c, number):
-    if not c.execute("SELECT 1 FROM accounts WHERE number=?",(number,)).fetchone():
+    if not c.execute("SELECT 1 FROM accounts WHERE number=? UNION SELECT 1 FROM bots WHERE number=? AND active=1",(number,number)).fetchone():
         raise HTTPException(404,"Account not found")
 
 @app.get("/v1/profile")
@@ -518,7 +519,7 @@ def users_search(request:Request,q:str):
     if len(q)<2:return {"users":[]}
     if not allow("lookup:"+n):raise HTTPException(429,"Too many requests")
     with db() as c:
-        rows=c.execute("""SELECT a.number FROM accounts a LEFT JOIN profiles p ON p.number=a.number LEFT JOIN profile_details d ON d.number=a.number LEFT JOIN phone_aliases ph ON ph.number=a.number WHERE a.number<>? AND (instr(lower(COALESCE(p.name,'')),?)>0 OR instr(lower(COALESCE(d.username,'')),?)>0 OR instr(COALESCE(ph.phone,''),?)>0) AND NOT EXISTS(SELECT 1 FROM blocks b WHERE (b.owner=? AND b.peer=a.number) OR (b.owner=a.number AND b.peer=?)) LIMIT 20""",(n,q,q,q,n,n)).fetchall()
+        rows=c.execute("""SELECT a.number FROM (SELECT number FROM accounts UNION SELECT number FROM bots WHERE active=1) a LEFT JOIN profiles p ON p.number=a.number LEFT JOIN profile_details d ON d.number=a.number LEFT JOIN phone_aliases ph ON ph.number=a.number WHERE a.number<>? AND (instr(lower(COALESCE(p.name,'')),?)>0 OR instr(lower(COALESCE(d.username,'')),?)>0 OR instr(COALESCE(ph.phone,''),?)>0) AND NOT EXISTS(SELECT 1 FROM blocks b WHERE (b.owner=? AND b.peer=a.number) OR (b.owner=a.number AND b.peer=?)) LIMIT 20""",(n,q,q,q,n,n)).fetchall()
     return {"users":[public_profile(x["number"]) for x in rows]}
 
 @app.get("/v1/users/{number}")
@@ -1581,3 +1582,115 @@ def delete_story(mid:int,request:Request):
     with db() as c:
         if not c.execute("DELETE FROM stories WHERE id=? AND owner=?",(mid,n)).rowcount: raise HTTPException(404,"Story not found")
     return {"ok":True}
+
+
+# Independent Toxicgram Bot API. Tokens are never stored in plaintext.
+class BotCreate(BaseModel):
+    name: str = Field(min_length=1,max_length=64)
+    username: str = Field(min_length=5,max_length=32)
+
+@app.post("/v1/bots")
+def create_bot(body:BotCreate,request:Request):
+    _,owner=session(request)
+    if not allow("bot-create:"+owner,5): raise HTTPException(429,"Too many requests")
+    username=body.username.strip().lstrip("@").lower()
+    name=body.name.strip()
+    if not name or not re.fullmatch(r"[a-z0-9_]{5,32}",username) or not username.endswith("bot"):
+        raise HTTPException(400,"Username must end in bot")
+    token=secrets.token_urlsafe(48)
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if c.execute("SELECT COUNT(*) FROM bots WHERE owner=?",(owner,)).fetchone()[0]>=20:
+            raise HTTPException(429,"Bot limit")
+        if c.execute("SELECT 1 FROM profile_details WHERE username=? COLLATE NOCASE",(username,)).fetchone():
+            raise HTTPException(409,"Username taken")
+        while True:
+            d=f"{secrets.randbelow(100000000):08d}"
+            n=f"TG-{d[:4]}-{d[4:]}"
+            if not c.execute("SELECT 1 FROM accounts WHERE number=? UNION SELECT 1 FROM bots WHERE number=?",(n,n)).fetchone(): break
+        c.execute("INSERT INTO bots(number,owner,token_hash) VALUES (?,?,?)",(n,owner,digest("bot:"+token)))
+        c.execute("INSERT INTO profiles(number,name) VALUES (?,?)",(n,name))
+        c.execute("INSERT INTO profile_details(number,username) VALUES (?,?)",(n,username))
+        c.commit()
+    return {"id":n,"username":username,"token":token}
+
+@app.get("/v1/bots")
+def list_bots(request:Request):
+    _,owner=session(request)
+    with db() as c:
+        return {"bots":[dict(x) for x in c.execute("SELECT b.number AS id,b.active,p.name,d.username FROM bots b JOIN profiles p ON p.number=b.number JOIN profile_details d ON d.number=b.number WHERE b.owner=?",(owner,))]}
+
+@app.post("/v1/bots/{number}/token")
+def rotate_bot_token(number:str,request:Request):
+    _,owner=session(request)
+    token=secrets.token_urlsafe(48)
+    with db() as c:
+        if not c.execute("UPDATE bots SET token_hash=? WHERE number=? AND owner=? AND active=1",(digest("bot:"+token),number,owner)).rowcount:
+            raise HTTPException(404,"Bot not found")
+    return {"token":token}
+
+def bot_identity(c,n):
+    row=c.execute("SELECT p.name,d.username FROM profiles p LEFT JOIN profile_details d ON d.number=p.number WHERE p.number=?",(n,)).fetchone()
+    return {"id":n,"is_bot":bool(c.execute("SELECT 1 FROM bots WHERE number=?",(n,)).fetchone()),"first_name":row["name"] if row else n,"username":row["username"] if row else None}
+
+@app.api_route("/bot/{method}",methods=["GET","POST"])
+async def bot_api(method:str,request:Request):
+    from fastapi.responses import JSONResponse
+    def fail(code,msg):
+        return JSONResponse({"ok":False,"error_code":code,"description":msg},status_code=code)
+    scheme,_,token=request.headers.get("Authorization","").partition(" ")
+    if scheme.lower()!="bearer" or not re.fullmatch(r"[A-Za-z0-9_-]{64}",token):
+        return fail(401,"Unauthorized")
+    with db() as c:
+        row=c.execute("SELECT number FROM bots WHERE token_hash=? AND active=1 AND NOT EXISTS(SELECT 1 FROM account_freezes WHERE number=bots.owner OR number=bots.number)",(digest("bot:"+token),)).fetchone()
+    if not row: return fail(401,"Unauthorized")
+    n=row["number"]
+    if not allow("bot-api:"+n,120): return fail(429,"Too many requests")
+    try:
+        data=dict(request.query_params)
+        if request.method=="POST":
+            raw=await read_limited(request,65536)
+            if raw:
+                payload=json.loads(raw)
+                if not isinstance(payload,dict): return fail(400,"Invalid JSON object")
+                data.update(payload)
+        with db() as c:
+            if method=="getMe":
+                result=bot_identity(c,n)
+            elif method=="getUpdates":
+                offset=max(0,int(data.get("offset",0)))
+                limit=max(1,min(100,int(data.get("limit",100))))
+                rows=c.execute("SELECT * FROM messages WHERE recipient=? AND id>=? ORDER BY id LIMIT ?",(n,offset,limit)).fetchall()
+                result=[{"update_id":x["id"],"message":{"message_id":x["id"],"from":bot_identity(c,x["sender"]),"chat":{"id":x["sender"],"type":"private"},"date":x["created"],"text":x["body"]}} for x in rows]
+            elif method in ("sendMessage","editMessageText","deleteMessage"):
+                if request.method!="POST": return fail(405,"POST required")
+                peer=normalize_number(str(data.get("chat_id","")))
+                c.execute("BEGIN IMMEDIATE")
+                require_peer(c,peer)
+                if c.execute("SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)",(n,peer,peer,n)).fetchone():
+                    return fail(403,"Messaging unavailable")
+                if not c.execute("SELECT 1 FROM messages WHERE sender=? AND recipient=?",(peer,n)).fetchone():
+                    return fail(403,"User must contact bot first")
+                if method!="deleteMessage":
+                    value=data.get("text")
+                    if not isinstance(value,str) or not 1<=len(value.strip())<=4000: return fail(400,"Invalid text")
+                    value=value.strip()
+                if method=="sendMessage":
+                    now=int(time.time())
+                    mid=c.execute("INSERT INTO messages(sender,recipient,body,created) VALUES (?,?,?,?)",(n,peer,value,now)).lastrowid
+                else:
+                    mid=int(data.get("message_id",0))
+                    old=c.execute("SELECT * FROM messages WHERE id=? AND sender=? AND recipient=?",(mid,n,peer)).fetchone()
+                    if not old: return fail(404,"Message not found")
+                    now=old["created"]
+                    if method=="deleteMessage":
+                        c.execute("DELETE FROM messages WHERE id=?",(mid,))
+                    else:
+                        c.execute("UPDATE messages SET body=? WHERE id=?",(value,mid))
+                        c.execute("INSERT INTO message_edits VALUES (?,?) ON CONFLICT(message_id) DO UPDATE SET edited=excluded.edited",(mid,int(time.time())))
+                result=True if method=="deleteMessage" else {"message_id":mid,"from":bot_identity(c,n),"chat":{"id":peer,"type":"private"},"date":now,"text":value}
+                c.commit()
+            else: return fail(404,"Unknown method")
+        return {"ok":True,"result":result}
+    except HTTPException as exc: return fail(exc.status_code,str(exc.detail))
+    except (ValueError,TypeError,OverflowError): return fail(400,"Invalid parameters")
